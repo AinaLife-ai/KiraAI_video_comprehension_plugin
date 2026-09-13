@@ -604,6 +604,18 @@
         "default": "",
         "hint": "如 whisper-1 / FunAudioLLM/SenseVoiceSmall / whisper-large-v3-turbo"
       },
+      "audio_stt_extra_headers": {
+        "type": "json",
+        "name": "ASR 额外请求头",
+        "default": {},
+        "hint": "JSON 对象，合并进 ASR 请求头。例如 {\"X-Api-Version\":\"2024-01\"} 或自定义鉴权头"
+      },
+      "audio_stt_extra_body": {
+        "type": "json",
+        "name": "ASR 额外表单字段",
+        "default": {},
+        "hint": "JSON 对象。ASR 走 multipart 表单，所以这里是「再往表单里塞字段」，不是 JSON body 合并。例如 {\"temperature\":0} 或 {\"language\":\"zh\"}。插件自身的 file/model/response_format 不会被覆盖"
+      },
       "audio_wait_sec": {
         "type": "integer",
         "name": "分析时最多等待(秒)",

@@ -44,7 +44,7 @@ from asr import (transcribe as asr_transcribe, build_timeline_doc, ASRError,
                   normalize_segments_by_duration)
 from video_host import upload_to_any, UploadError, DEFAULT_HOSTS as DEFAULT_UPLOAD_HOSTS
 from llm_proxy import (ModelProfile, select_model, build_meta, analyze_frames,
-                       analyze_native, NATIVE_MAX_MB)
+                       analyze_native, NATIVE_MAX_MB, _as_dict)
 from bili_dl import (search_bili, get_bili_info, get_ai_summary, download_bili_video,
                      extract_bvid, BiliError, get_bilibili_subtitle)
 
@@ -208,6 +208,8 @@ class VideoComprehensionPlugin(BasePlugin):
         self.audio_block_sec = float(au.get("audio_block_sec", 30) or 30)
         self.audio_gap_sec = float(au.get("audio_gap_sec", 2.5) or 2.5)
         self.bili_use_subtitle = bool(au.get("bili_use_subtitle", True))
+        self.audio_extra_headers = _as_dict(au.get("audio_stt_extra_headers"))
+        self.audio_extra_body = _as_dict(au.get("audio_stt_extra_body"))
         self.audio_max_blocks = int(au.get("audio_max_blocks", 80) or 80)
         self.audio_concurrency = max(1, min(16, int(au.get("audio_concurrency", 5) or 5)))
         self.audio_silence_db = float(au.get("audio_silence_db", -35) or -35)
@@ -789,7 +791,9 @@ class VideoComprehensionPlugin(BasePlugin):
                                              self.audio_api_key, self.audio_model,
                                              timeout=self.audio_timeout,
                                              language=self.audio_language,
-                                             use_proxy=self.audio_use_proxy)
+                                             use_proxy=self.audio_use_proxy,
+                                             extra_headers=self.audio_extra_headers,
+                                             extra_body=self.audio_extra_body)
                     txt = (r.get("text") or "").strip()
                     return {"start": s, "end": e, "text": txt} if txt else None
                 except Exception as ex:
@@ -852,7 +856,9 @@ class VideoComprehensionPlugin(BasePlugin):
             result = await asr_transcribe(wav, self.audio_base_url, self.audio_api_key,
                                           self.audio_model, timeout=self.audio_timeout,
                                           language=self.audio_language,
-                                          use_proxy=self.audio_use_proxy)
+                                          use_proxy=self.audio_use_proxy,
+                                          extra_headers=self.audio_extra_headers,
+                                          extra_body=self.audio_extra_body)
             segs = result.get("segments") or []
             native = bool(segs)
             if segs:

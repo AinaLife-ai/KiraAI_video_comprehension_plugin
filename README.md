@@ -150,6 +150,17 @@ B站视频 → 取字幕轨（wbi 签名）→ 挑中文轨 → 下载字幕 JSO
 
 **三项缺任意一项就自动跳过转写**（不影响视频分析本身）。
 
+### 自定义请求头 / 表单字段
+
+ASR 也支持自定义请求（同模型组那套用法）：
+
+| 配置 | 作用 | 示例 |
+|------|------|------|
+| `audio_stt_extra_headers` | 合并进 ASR **请求头** | `{"X-Api-Version": "2024-01"}` |
+| `audio_stt_extra_body` | 追加 **multipart 表单字段** | `{"temperature": 0, "language": "zh"}` |
+
+⚠️ ASR 走的是 `multipart/form-data`（不是 JSON body），所以第二个是"**再往表单里塞几个字段**"。数值/布尔/对象会自动转成表单能接受的形式。插件自身的 `file` / `model` / `response_format` 等关键字段**受保护，不会被覆盖**。
+
 ### 时间轴怎么来（尽量不切块）
 
 | 服务的返回 | 处理 |
@@ -293,6 +304,7 @@ analyze_video(session_id="abc123", segments=[[10,30],[100,130]])   # 一次多�
 
 ## 版本
 
+- 1.12.1 — ASR 支持自定义请求头（`audio_stt_extra_headers`）与额外表单字段（`audio_stt_extra_body`），关键字段受保护不被覆盖
 - 1.12.0 — 新增**B站官方字幕优先**（`bili_use_subtitle`）：B站视频有 CC/AI 字幕时直接用它做时间轴（精确、免费、不跑 ASR、不抽音轨），没有才回退音频识别；AI 字幕需 B站 Cookie
 - 1.12.0 — 新增**语音转写**：把视频里的声音转成带时间轴的文字，`native`/`frames` 两种模式都会带上。走 OpenAI 兼容的 `/audio/transcriptions`，尽量用服务原生时间戳（不切块）；拿不到时间戳时自动本地 VAD 切块补轴（**块数超限自动合并保内容，不丢尾**；切块粗细由 `audio_gap_sec` 控制，默认 2.5 秒）；返回格式兼容 OpenAI/阿里云/词级/纯文本多种形态。附带 **L2 非语音声音标注**。后台并行转写，分析时最多等 30 秒（超时就不带，绝不卡住；结果落盘缓存下次可用）
 - 1.11.1 — **修复装饰器错位**（严重）：`@on.im_message` 被误挂到 `_is_video_ele` 上，导致每收到一条消息就抛 `TypeError: object bool can't be used in 'await' expression`，同时 `_detect` 丢失注册、**视频检测整体失效**。已加防回归断言（hook 名单必须精确匹配 + 每个 hook 必须是 async 函数）
