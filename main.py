@@ -613,7 +613,6 @@ class VideoComprehensionPlugin(BasePlugin):
 
     # ── 视频检测 ──
 
-    @on.im_message(priority=Priority.HIGH)
     @staticmethod
     def _is_video_ele(ele) -> bool:
         """判断是否为视频元素（真实类名是 Video；兼容子类与包装类）"""
@@ -700,6 +699,7 @@ class VideoComprehensionPlugin(BasePlugin):
             logger.warning("[VC] 视频缓存失败: %s", e)
         return ""
 
+    @on.im_message(priority=Priority.HIGH)
     async def _detect(self, event: KiraMessageEvent, *_):
         if not self.enabled or not self._ok(event) or not self._is_qq(event):
             return
