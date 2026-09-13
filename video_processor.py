@@ -26,6 +26,10 @@ from io import BytesIO
 from pathlib import Path
 from typing import Optional
 
+# 下载视频时带的 UA（部分 CDN 会对默认 UA 返回 403）
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
 try:
     from PIL import Image, ImageDraw, ImageFont
     from PIL import __version__ as _pil_version
@@ -99,18 +103,57 @@ def _get_video_info(video_path: str) -> dict:
 
 # ── 视频下载 ───────────────────────────────────────────────
 
-async def download_video(url: str, dest: str, timeout: int = 120) -> str:
-    """异步下载视频文件，返回本地路径"""
+class DownloadTooLarge(Exception):
+    """下载体积超过调用方给定上限（流式检测，已中止）"""
+
+
+async def download_video(url: str, dest: str, timeout: int = 120,
+                         max_bytes: int = 0, headers: dict | None = None) -> str:
+    """异步下载视频文件，返回本地路径。
+
+    max_bytes > 0 时边下边校验，超过即中止并抛 DownloadTooLarge
+    （避免群里有人丢个几 GB 的文件把磁盘写满）。
+    """
     loop = asyncio.get_event_loop()
 
     def _dl():
-        urllib.request.urlretrieve(url, dest)
+        req = urllib.request.Request(url, headers=headers or {"User-Agent": UA})
+        try:
+            resp = urllib.request.urlopen(req, timeout=timeout)
+        except Exception:
+            # 带 UA 被拒时退回默认请求头再试一次
+            resp = urllib.request.urlopen(urllib.request.Request(url), timeout=timeout)
+        with resp:
+            if max_bytes > 0:
+                cl = resp.headers.get("Content-Length")
+                try:
+                    if cl and int(cl) > max_bytes:
+                        raise DownloadTooLarge(
+                            f"文件 {int(cl) / 1048576:.1f}MB 超过上限 {max_bytes / 1048576:.0f}MB")
+                except ValueError:
+                    pass
+            total = 0
+            with open(dest, "wb") as f:
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if max_bytes > 0 and total > max_bytes:
+                        raise DownloadTooLarge(
+                            f"下载已超过上限 {max_bytes / 1048576:.0f}MB，已中止")
+                    f.write(chunk)
         return dest
 
-    return await asyncio.wait_for(
-        loop.run_in_executor(None, _dl),
-        timeout=timeout,
-    )
+    try:
+        return await asyncio.wait_for(loop.run_in_executor(None, _dl), timeout=timeout)
+    except DownloadTooLarge:
+        try:
+            if os.path.exists(dest):
+                os.remove(dest)
+        except Exception:
+            pass
+        raise
 
 
 # ── 视频压缩 ───────────────────────────────────────────────
@@ -634,7 +677,9 @@ async def process_video(
         if is_local:
             raw_path = video_url
         else:
-            await download_video(video_url, raw_path, timeout=download_timeout)
+            # 边下边限流：超过 max_file_mb 直接中止，避免把磁盘写满
+            await download_video(video_url, raw_path, timeout=download_timeout,
+                                 max_bytes=int(max_file_mb * 1024 * 1024))
 
         # 2. 检查大小
         file_size_mb = os.path.getsize(raw_path) / (1024 * 1024)

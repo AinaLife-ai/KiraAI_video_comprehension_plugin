@@ -39,6 +39,12 @@
           "qq"
         ]
       },
+      "auto_cache_video": {
+        "type": "switch",
+        "name": "自动缓存收到的视频",
+        "default": true,
+        "hint": "检测到 QQ 视频（含引用/转发消息里的）立即下载到本地缓存，并在下一轮对话把路径告诉 bot，方便它直接使用。框架在拿不到视频体积时不会缓存（还会误报「超过 10MB」），此项可绕开该问题"
+      },
       "max_session_per_user": {
         "type": "integer",
         "name": "每会话最大视频数",
@@ -92,6 +98,24 @@
         "default": 30,
         "minimum": 5,
         "maximum": 200
+      },
+      "cache_max_file_mb": {
+        "type": "integer",
+        "name": "单个缓存视频上限(MB)",
+        "default": 20,
+        "hint": "自动缓存收到的视频时，超过此大小就中止下载（边下边检测）。防止有人发超大文件把磁盘写满。0 = 不限制"
+      },
+      "cache_ttl_hours": {
+        "type": "integer",
+        "name": "缓存保留时长(小时)",
+        "default": 24,
+        "hint": "超过此时长的缓存视频/分析产物会被定时清理（每 5 分钟检查一次）。0 = 不按时间清理"
+      },
+      "cache_max_total_mb": {
+        "type": "integer",
+        "name": "缓存目录总量上限(MB)",
+        "default": 2048,
+        "hint": "「其他视频缓存」目录总占用超过此值就从最旧开始删。0 = 不限制"
       }
     }
   },
@@ -399,9 +423,10 @@
       "max_duration_sec": {
         "type": "integer",
         "name": "最大视频时长(秒)",
-        "default": 600,
+        "default": 0,
         "minimum": 10,
-        "maximum": 7200
+        "maximum": 7200,
+        "hint": "0 = 自动跟随（取所有已启用模型组里最大的 max_video_sec，避免组里配了 1800 秒却被这里 600 秒先拦死）；填正数则作为独立硬上限。超过此值直接拒绝处理，不会降级"
       },
       "download_timeout_sec": {
         "type": "integer",
@@ -490,7 +515,8 @@
         "name": "下载最大时长(秒)",
         "default": 600,
         "minimum": 10,
-        "maximum": 7200
+        "maximum": 7200,
+        "hint": "仅用于「发视频到 QQ」链路；视频分析链路的时长限制统一由 安全限制 → 最大视频时长 控制"
       }
     }
   },
