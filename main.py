@@ -122,7 +122,7 @@ class VideoComprehensionPlugin(BasePlugin):
         self.video_analysis_enabled = basic.get("video_analysis_enabled", False)
         self.auto_select = basic.get("auto_select", True)
         self.default_model = str(basic.get("default_model", "auto"))
-        self.allowed_adapters = basic.get("allowed_adapters", ["qq"])
+        self.allowed_adapters = basic.get("allowed_adapters", [])
         self.max_session_per_user = int(basic.get("max_session_per_user", 5))
         self.auto_cache_video = bool(basic.get("auto_cache_video", True))
 
@@ -182,7 +182,7 @@ class VideoComprehensionPlugin(BasePlugin):
             "你刚刚收到一个视频。请分析其内容，包括：\n1. 视频整体描述\n2. 关键事件时间线\n3. 值得注意的细节\n4. 语音/对话内容")
 
         us = cfg.get("section_upload", {}) or {}
-        self.upload_enabled = bool(us.get("upload_enabled", False))
+        self.upload_enabled = bool(us.get("upload_enabled", True))
         # 多源：upload_hosts（list）优先；兼容旧的 upload_host（string）
         hosts = us.get("upload_hosts")
         if hosts is None:
@@ -935,7 +935,7 @@ class VideoComprehensionPlugin(BasePlugin):
 
     @on.im_message(priority=Priority.HIGH)
     async def _detect(self, event: KiraMessageEvent, *_):
-        if not self.enabled or not self._ok(event) or not self._is_qq(event):
+        if not self.enabled or not self._ok(event):
             return
         sid = self._sid(event)
         url = None
@@ -982,7 +982,8 @@ class VideoComprehensionPlugin(BasePlugin):
         # 3) 兜底：主动调 OneBot 接口拉（当前消息 → 引用消息）
         #    只在「确实有视频迹象」时才调，避免每条纯文字消息都白跑一次 API
         reply_ids = self._reply_message_ids(chain_top)
-        if not url and (saw_video_ele or has_video_seg or reply_ids):
+        # 主动调 get_msg 是 OneBot 的能力，其他平台只靠消息链/raw_message
+        if not url and self._is_qq(event) and (saw_video_ele or has_video_seg or reply_ids):
             try:
                 ad = self.ctx.adapter_mgr.get_adapter(event.adapter.name)
                 cl = ad.get_client()
@@ -1232,7 +1233,9 @@ class VideoComprehensionPlugin(BasePlugin):
         name="analyze_video",
         description=("分析视频内容。支持QQ视频/B站视频/本地路径。首次返回session_id，追问传回。"
                      "只看某一段时间就传 start_sec/end_sec（数字秒）；一次看多段传 segments=[[起,止],...]（最多5段、每段≤300秒）。"
-                     "时间段分析会复用已下载的视频，不会重新下载。"),
+                     "时间段分析会复用已下载的视频，不会重新下载。"
+                     "用户指定了模型（如「用 Agnes 分析」）就传 model=那个名字；不确定有哪些可选就先不传，"
+                     "传错时返回值会列出全部可用模型组。"),
         params={
             "type": "object",
             "properties": {
@@ -1241,6 +1244,7 @@ class VideoComprehensionPlugin(BasePlugin):
                 "deep_analysis": {"type": "boolean", "description": "深度视觉分析", "default": False},
                 "local_path": {"type": "string", "description": "本地视频路径"},
                 "session_id": {"type": "string", "description": "追问用session_id"},
+                "model": {"type": "string", "description": "指定用哪个模型组（填别名/模型名/组号，如 \"Agnes\"）；不填则按优先级自动选"},
                 "start_sec": {"type": "number", "description": "只分析从第几秒开始（数字秒）", "default": 0},
                 "end_sec": {"type": "number", "description": "分析到第几秒结束；传 0 = 到视频结尾", "default": 0},
                 "segments": {
@@ -1255,10 +1259,16 @@ class VideoComprehensionPlugin(BasePlugin):
                              deep_analysis: bool = False, local_path: str = "",
                              session_id: str = "",
                              start_sec: float = 0, end_sec: float = 0,
-                             segments=None) -> str:
+                             segments=None, model: str = "") -> str:
         if not self.video_analysis_enabled:
             return "⚠️ 视频分析功能已关闭，可在 WebUI 启用"
 
+        profile_spec = None
+        if model.strip():
+            profile_spec = self._find_profile(model)
+            if profile_spec is None:
+                return (f"⚠️ 找不到名为「{model}」的模型组。"
+                        f"当前可用：{self._list_profiles_text()}")
         segs, err = self._parse_segments(start_sec, end_sec, segments)
         if err: return f"⚠️ {err}"
 
@@ -1269,8 +1279,8 @@ class VideoComprehensionPlugin(BasePlugin):
             sess = self._get_by_session_id(session_id)
             if not sess: return f"⚠️ session_id={session_id} 不存在"
             self._register_session(sess, sid)
-            if segs: return await self._segment_analyze(sess, question, segs)
-            if question: return await self._followup(sess, question)
+            if segs: return await self._segment_analyze(sess, question, segs, profile_spec)
+            if question: return await self._followup(sess, question, profile_spec)
             return (f"📌 session_id={session_id}\n🤖 {sess.analysis_model}\n"
                     f"{self._link_line(sess.host_url)}━━━\n{sess.analysis[:500]}\n━━━\n"
                     f"追问用 session_id=\"{session_id}\"")
@@ -1299,7 +1309,7 @@ class VideoComprehensionPlugin(BasePlugin):
                 olds = self._list_sessions(sid)
                 if olds:
                     cur = olds[0]
-                    if question: return await self._followup(cur, question)
+                    if question: return await self._followup(cur, question, profile_spec)
                     return (f"🔁 已有{len(olds)}个历史，最新session_id={cur.session_id}\n"
                             f"🤖 {cur.analysis_model}\n{self._link_line(cur.host_url)}━━━\n"
                             f"{cur.analysis[:300]}\n━━━\n追问用 session_id=\"{cur.session_id}\"")
@@ -1309,8 +1319,8 @@ class VideoComprehensionPlugin(BasePlugin):
         if sess_id in self._sessions:
             cur = self._sessions[sess_id]
             self._register_session(cur, sid)
-            if segs: return await self._segment_analyze(cur, question, segs)
-            if question: return await self._followup(cur, question)
+            if segs: return await self._segment_analyze(cur, question, segs, profile_spec)
+            if question: return await self._followup(cur, question, profile_spec)
             if deep_analysis and cur.analysis_mode == "AI_summary" and not cur.grids_base64:
                 return await self._deep(cur)
             return (f"🔁 已有分析\n📌 session_id={sess_id}\n🤖 {cur.analysis_model}\n"
@@ -1325,7 +1335,46 @@ class VideoComprehensionPlugin(BasePlugin):
             except Exception as e: logger.info("[VC] B站AI降级: %s", e)
 
         return await self._vision(sess_id, sid, source_type, source_url, bvid,
-                                   question or "请完整分析这段视频", segments=segs)
+                                   question or "请完整分析这段视频", segments=segs,
+                                   model_spec=profile_spec)
+
+    # ── 模型组选择（支持按别名/模型名/组号指定） ──
+
+    def _find_profile(self, spec: str):
+        """按「别名 → 模型名 → 组号」找模型组；找不到返回 None。
+
+        让 bot 能听懂「用 Agnes 抽帧分析这个」这类指令。
+        """
+        s = (spec or "").strip()
+        if not s:
+            return None
+        if s.isdigit():
+            for p in self._profiles:
+                if str(p.group) == s:
+                    return p
+        low = s.lower()
+        for p in self._profiles:                       # 别名精确
+            if p.label and p.label.lower() == low:
+                return p
+        for p in self._profiles:                       # 模型名精确
+            if p.name and p.name.lower() == low:
+                return p
+        for p in self._profiles:                       # 别名包含
+            if p.label and low in p.label.lower():
+                return p
+        for p in self._profiles:                       # 模型名包含
+            if p.name and low in p.name.lower():
+                return p
+        return None
+
+    def _list_profiles_text(self) -> str:
+        if not self._profiles:
+            return "（没有启用任何模型组）"
+        parts = []
+        for p in sorted(self._profiles, key=lambda x: x.priority):
+            tag = p.label or p.name or f"组{p.group}"
+            parts.append(f"{tag}(组{p.group}/{p.mode})")
+        return "、".join(parts)
 
     # ── 时间段参数解析 ──
 
@@ -1399,7 +1448,8 @@ class VideoComprehensionPlugin(BasePlugin):
 
     # ── 视觉分析（非B站视频存到 other_cache_dir） ──
 
-    async def _vision(self, sess_id, sid, stype, surl, bvid, question, segments=None):
+    async def _vision(self, sess_id, sid, stype, surl, bvid, question,
+                      segments=None, model_spec=None):
         if not self._profiles: return "未配置模型"
 
         # 选模型用的时长：指定片段时用片段总长，否则用视频真实时长
@@ -1418,7 +1468,7 @@ class VideoComprehensionPlugin(BasePlugin):
                 duration_hint = float(_get_video_info(surl).get("duration") or 0) or self.max_duration
             except Exception:
                 pass
-        profile = select_model(self._profiles, duration_hint, self.default_model)
+        profile = model_spec or select_model(self._profiles, duration_hint, self.default_model)
         if not profile: return "无合适模型"
 
         info = {}          # B 站分支会填上 cid 等（供字幕获取用）
@@ -1652,7 +1702,7 @@ class VideoComprehensionPlugin(BasePlugin):
             logger.error("[VC] LLM失败: %s", e)
             return f"⚠️ AI分析失败（{type(e).__name__}）", f"{profile.name} (frames)", "", None
 
-    async def _segment_analyze(self, sess, question, segs):
+    async def _segment_analyze(self, sess, question, segs, model_spec=None):
         """对已有 session 的视频做指定时间段分析（用本地文件，不重新下载）"""
         path = sess.compressed_path
         if not path or not os.path.isfile(path):
@@ -1669,7 +1719,8 @@ class VideoComprehensionPlugin(BasePlugin):
         if not real:
             return (f"⚠️ 时间段超出视频时长（视频共 {sess.duration:.1f}s）")
         total = sum(e - s for s, e in real)
-        profile = select_model(self._profiles, total, self.default_model) or self._profiles[0]
+        profile = (model_spec or select_model(self._profiles, total, self.default_model)
+                   or self._profiles[0])
 
         work = os.path.join(os.path.dirname(path), f"seg_{int(time.time()*1000) % 10**9}")
         os.makedirs(work, exist_ok=True)
@@ -1706,15 +1757,15 @@ class VideoComprehensionPlugin(BasePlugin):
                                    bvid.group(0) if bvid else "",
                                    "对B站AI总结做补充，深入分析画面")
 
-    async def _followup(self, sess, question):
+    async def _followup(self, sess, question, model_spec=None):
         if not question:
             return (f"当前 session={sess.session_id}\n{self._link_line(sess.host_url)}"
                     f"{sess.analysis[:300]}\n追问用 session_id=\"{sess.session_id}\"")
         if not sess.grids_base64:
             return (f"只有{sess.analysis_mode}结果，深度分析后可追问画面。\n"
                     f"{self._link_line(sess.host_url)}已有: {sess.analysis[:200]}")
-        profile = select_model(self._profiles, sess.duration, self.default_model) or (
-            self._profiles[0] if self._profiles else None)
+        profile = (model_spec or select_model(self._profiles, sess.duration, self.default_model)
+                   or (self._profiles[0] if self._profiles else None))
         if not profile: return "无可用模型"
         meta = build_meta(sess.duration, sess.total_frames, len(sess.grids_base64),
                           sess.scene_count, sess.timestamps)
