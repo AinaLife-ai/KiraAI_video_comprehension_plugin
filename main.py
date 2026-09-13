@@ -1,0 +1,1260 @@
+"""
+Video Comprehension 插件 — QQ/B站视频理解
+
+功能：
+  - send_video 工具：下载B站视频+压缩+发送到QQ
+  - search_bili_video 工具：搜索B站视频
+  - analyze_video 工具（默认关）：视频内容分析
+  - 自动链接检测钩子（默认关）
+  - 缓存双向：B站 → files/video_cache/，其他 → files/video_analysis_cache/
+"""
+from __future__ import annotations
+
+# ── 导入区 ──
+
+import asyncio
+import base64
+import hashlib
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+from typing import Optional
+
+_PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+if _PLUGIN_DIR not in sys.path:
+    sys.path.insert(0, _PLUGIN_DIR)
+
+from core.plugin import BasePlugin, logger, on, Priority, register
+from core.chat.message_utils import KiraMessageEvent, KiraMessageBatchEvent
+from core.chat import MessageChain
+from core.chat.message_elements import Text
+from core.provider import LLMRequest
+from core.utils.path_utils import get_data_path
+
+from video_processor import process_video, compress_video, clip_video
+from video_host import upload_to_any, UploadError, DEFAULT_HOSTS as DEFAULT_UPLOAD_HOSTS
+from llm_proxy import (ModelProfile, select_model, build_meta, analyze_frames,
+                       analyze_native, NATIVE_MAX_MB)
+from bili_dl import search_bili, get_bili_info, get_ai_summary, download_bili_video, extract_bvid, BiliError
+
+BILI_RE = re.compile(r"(BV[0-9A-Za-z]{10}|b23\.tv/[^\s]+|bilibili\.com/(?:video/|BV))", re.I)
+BVID_RE = re.compile(r"BV[0-9A-Za-z]{10}")
+
+# 时间段分析限制
+MAX_SEGMENTS = 5          # 一次最多几段
+MAX_SEGMENT_SEC = 300     # 单段最长秒数
+
+
+class VideoSession:
+    __slots__ = (
+        "session_id", "sid", "source", "source_url", "title",
+        "compressed_path", "duration", "width", "height",
+        "grids_base64", "scene_count", "total_frames", "timestamps",
+        "file_size_mb", "compressed_size_mb",
+        "analysis", "analysis_model", "analysis_mode",
+        "history", "last_interact", "bili_ai_summary",
+    )
+    def __init__(self, session_id, sid, source, source_url):
+        self.session_id = session_id
+        self.sid = sid
+        self.source = source
+        self.source_url = source_url
+        self.title = ""
+        self.compressed_path = ""
+        self.duration = 0.0
+        self.width = self.height = 0
+        self.grids_base64 = []
+        self.scene_count = 0
+        self.total_frames = 0
+        self.timestamps = []
+        self.file_size_mb = self.compressed_size_mb = 0.0
+        self.analysis = ""
+        self.analysis_model = ""
+        self.analysis_mode = ""
+        self.history = []
+        self.last_interact = time.time()
+        self.bili_ai_summary = None
+
+    def is_stale(self, ttl: int) -> bool:
+        return time.time() - self.last_interact > ttl * 60
+
+    def add_turn(self, q: str, a: str):
+        self.history.append({"role": "user", "text": q})
+        self.history.append({"role": "bot", "text": a})
+        self.last_interact = time.time()
+
+
+class VideoComprehensionPlugin(BasePlugin):
+    def __init__(self, ctx, cfg: dict):
+        super().__init__(ctx, cfg)
+        # 运行状态（热重载配置时保留）
+        self._pending: dict[str, dict] = {}
+        self._sessions: dict[str, VideoSession] = {}
+        self._sid_sessions: dict[str, list[str]] = {}
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._cleanup: Optional[asyncio.Task] = None
+        self._auto_sent: dict[str, dict] = {}  # sid → {bvid, title, file_path, text}
+        self._ffmpeg_ok = False
+        self._stream_unsupported = False
+        self._upload_cache: dict[str, str] = {}   # 本地路径 → 已上传的公开 URL
+        self._load_cfg(cfg)
+
+    def _load_cfg(self, cfg: dict):
+        """读取/热重载配置（不影响会话与后台任务状态）"""
+        basic = cfg.get("section_basic", {}) or {}
+        self.enabled = basic.get("enabled", True)
+        self.video_analysis_enabled = basic.get("video_analysis_enabled", False)
+        self.auto_select = basic.get("auto_select", True)
+        self.default_model = str(basic.get("default_model", "auto"))
+        self.allowed_adapters = basic.get("allowed_adapters", ["qq"])
+        self.max_session_per_user = int(basic.get("max_session_per_user", 5))
+
+        # 双缓存
+        cs = cfg.get("section_cache", {}) or {}
+        self.bili_cache_dir = str(Path(get_data_path()) / cs.get("bili_cache_dir", "files/video_cache").lstrip("/"))
+        self.bili_max_cache = int(cs.get("bili_max_cache_files", 100))
+        self.bili_cleanup = int(cs.get("bili_cleanup_count", 20))
+        self.other_cache_dir = str(Path(get_data_path()) / cs.get("other_cache_dir", "files/video_analysis_cache").lstrip("/"))
+        self.other_max_cache = int(cs.get("other_max_cache_files", 200))
+        self.other_cleanup = int(cs.get("other_cleanup_count", 30))
+
+        self._profiles: list[ModelProfile] = []
+        for g in range(1, 5):
+            p = ModelProfile.from_cfg(cfg, g)
+            if p: self._profiles.append(p)
+
+        fs = cfg.get("section_frame", {}) or {}
+        self.target_frames = int(fs.get("target_frames", 40))
+        self.max_per_grid = int(fs.get("max_frames_per_grid", 20))
+        self.grid_cols = int(fs.get("grid_cols", 5))
+        self.scene_threshold = float(fs.get("scene_threshold", 0.3))
+        self.cell_width = int(fs.get("frame_width", 320))
+        self.cell_ratio = fs.get("frame_ratio", "16:9")
+
+        lm = cfg.get("section_limits", {}) or {}
+        self.max_file_mb = int(lm.get("max_file_size_mb", 200))
+        self.max_duration = int(lm.get("max_duration_sec", 600))
+        self.dl_timeout = int(lm.get("download_timeout_sec", 120))
+
+        bs = cfg.get("section_bili", {}) or {}
+        self.bili_enabled = bs.get("bili_enabled", True)
+        self.bili_cookie = bs.get("bili_cookie", "")
+        self.bili_use_ai = bs.get("bili_use_ai_summary", True)
+        self.bili_search_n = int(bs.get("bili_search_count", 5))
+        self.bili_max_dl = int(bs.get("bili_max_download_sec", 600))
+        self.auto_send_link = bs.get("auto_send_link", False)
+        self.auto_send_allowed_sid = [str(s).strip() for s in bs.get("auto_send_allowed_sid", []) if str(s).strip()]
+        self.search_show_desc = bs.get("search_show_desc", True)
+        self.search_desc_max_chars = int(bs.get("search_desc_max_chars", 100))
+        self.bili_download_quality = bs.get("bili_download_quality", "low")
+        self.bili_compress_quality = bs.get("bili_compress_quality", "original")
+
+        ss = cfg.get("section_session", {}) or {}
+        self.session_ttl = int(ss.get("session_ttl_minutes", 30))
+        self.send_video_quality = ss.get("send_video_quality", "low")
+        self.default_prompt = ss.get("default_prompt",
+            "你刚刚收到一个视频。请分析其内容，包括：\n1. 视频整体描述\n2. 关键事件时间线\n3. 值得注意的细节\n4. 语音/对话内容")
+
+        us = cfg.get("section_upload", {}) or {}
+        self.upload_enabled = bool(us.get("upload_enabled", False))
+        # 多源：upload_hosts（list）优先；兼容旧的 upload_host（string）
+        hosts = us.get("upload_hosts")
+        if hosts is None:
+            old = us.get("upload_host")
+            hosts = [old] if old else []
+        if isinstance(hosts, str):
+            hosts = [hosts]
+        self.upload_hosts = [str(h).strip() for h in (hosts or []) if str(h).strip()] \
+            or list(DEFAULT_UPLOAD_HOSTS)
+        self.upload_host = self.upload_hosts[0]   # 兼容旧引用
+        self.upload_max_mb = int(us.get("upload_max_mb", 200))
+        self.upload_compress_over_mb = int(us.get("upload_compress_over_mb", 20))
+        self.upload_timeout = int(us.get("upload_timeout_sec", 300))
+        self.upload_keep_name = bool(us.get("upload_keep_name", True))
+        self.upload_use_proxy = bool(us.get("upload_use_proxy", False))
+
+
+    async def _ensure_ffmpeg_async(self):
+        """后台异步确保 ffmpeg 可用
+
+        策略：shutil.which() 检查 PATH → 有就用
+              → 没有就下载静态 ffmpeg 到缓存目录
+              → 加到 os.environ['PATH'] 全局生效
+        """
+        if self._ffmpeg_ok:
+            return True
+
+        # 1) 检查 PATH（ffmpeg + ffprobe 都需要）
+        ffmpeg_path = shutil.which("ffmpeg")
+        if ffmpeg_path:
+            if not shutil.which("ffprobe"):
+                logger.warning("[VC] ⚠️ ffmpeg 存在但 ffprobe 缺失，抽帧/时长探测会失败")
+            self._ffmpeg_ok = True
+            logger.info("[VC] ✅ ffmpeg 已可用: %s", ffmpeg_path)
+            return True
+
+        import platform as _pf
+        system = _pf.system().lower()
+        logger.info("[VC] ffmpeg 不在 PATH 中，系统=%s，准备下载静态版本...", system)
+
+        # 2) 尝试系统包管理器（仅 Linux）
+        if system == "linux":
+            for pm, cmd in [("apk", ["apk", "add", "ffmpeg"]),
+                            ("apt-get", ["apt-get", "install", "-y", "ffmpeg"])]:
+                try:
+                    which_pm = shutil.which(pm)
+                    if not which_pm: continue
+                    proc = await asyncio.create_subprocess_exec(
+                        *cmd, stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    if await proc.wait() == 0 and shutil.which("ffmpeg"):
+                        self._ffmpeg_ok = True
+                        logger.info("[VC] ✅ ffmpeg 通过 %s 安装成功", pm)
+                        return True
+                except: continue
+
+        # 3) 下载静态 ffmpeg（Win/Linux 通用兜底）
+        static_dir = os.path.join(self.bili_cache_dir, ".ffmpeg")
+        os.makedirs(static_dir, exist_ok=True)
+        exe_name = "ffmpeg.exe" if system == "windows" else "ffmpeg"
+        static_bin = os.path.join(static_dir, exe_name)
+
+        # 检查之前是否已下载
+        if os.path.isfile(static_bin):
+            os.environ["PATH"] = static_dir + os.pathsep + os.environ.get("PATH", "")
+            self._ffmpeg_ok = True
+            logger.info("[VC] ✅ 使用已下载的静态 ffmpeg: %s", static_bin)
+            return True
+
+        logger.info("[VC] ⬇️ 下载静态 ffmpeg → %s ...", static_bin)
+        try:
+            import httpx as _hx
+            arch = _pf.machine().lower()
+
+            if system == "windows":
+                # Windows: gyan.dev 提供的 zip
+                dl_url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+                async with _hx.AsyncClient(follow_redirects=True, timeout=180) as c:
+                    resp = await c.get(dl_url)
+                    if resp.status_code == 200:
+                        import zipfile, io
+                        with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+                            got = False
+                            for name in zf.namelist():
+                                if name.endswith(("ffmpeg.exe", "ffprobe.exe")):
+                                    zf.extract(name, static_dir)
+                                    exe_path = os.path.join(static_dir, name)
+                                    shutil.move(exe_path, os.path.join(static_dir, os.path.basename(name)))
+                                    got = True
+                            if got:
+                                # 清理多余文件
+                                for d in os.listdir(static_dir):
+                                    dp = os.path.join(static_dir, d)
+                                    if os.path.isdir(dp) and d.startswith("ffmpeg"):
+                                        shutil.rmtree(dp, ignore_errors=True)
+                                os.environ["PATH"] = static_dir + os.pathsep + os.environ.get("PATH", "")
+                                self._ffmpeg_ok = True
+                                logger.info("[VC] ✅ Windows 静态 ffmpeg+ffprobe 下载完成")
+                                return True
+            else:
+                # Linux: johnvansickle 提供的 tar.xz（同时包含 ffmpeg 与 ffprobe）
+                dl_url = "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-arm64-static.tar.xz" if arch in ("aarch64", "arm64") else "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
+                async with _hx.AsyncClient(follow_redirects=True, timeout=180) as c:
+                    resp = await c.get(dl_url)
+                    if resp.status_code == 200:
+                        import tarfile, io
+                        with tarfile.open(fileobj=io.BytesIO(resp.content)) as tar:
+                            got = False
+                            for m in tar.getmembers():
+                                base = os.path.basename(m.name)
+                                if base in ("ffmpeg", "ffprobe"):
+                                    tar.extract(m, path=static_dir)
+                                    exe_path = os.path.join(static_dir, m.name)
+                                    shutil.move(exe_path, os.path.join(static_dir, base))
+                                    os.chmod(os.path.join(static_dir, base), 0o755)
+                                    got = True
+                            if got:
+                                # 清理
+                                for d in os.listdir(static_dir):
+                                    dp = os.path.join(static_dir, d)
+                                    if os.path.isdir(dp) and d.startswith("ffmpeg"):
+                                        shutil.rmtree(dp, ignore_errors=True)
+                                os.environ["PATH"] = static_dir + os.pathsep + os.environ.get("PATH", "")
+                                self._ffmpeg_ok = True
+                                logger.info("[VC] ✅ Linux 静态 ffmpeg+ffprobe 下载完成")
+                                return True
+        except Exception as e:
+            logger.warning("[VC] 静态 ffmpeg 下载失败: %s", e)
+
+        logger.warning("[VC] ❌ 无法获取 ffmpeg，视频压缩/抽帧/音视频合并功能不可用")
+        return False
+
+    async def initialize(self):
+        if not self.enabled: return
+        # 后台异步安装 ffmpeg（首条日志提示用户）
+        logger.info("[VC] 🔍 检查 ffmpeg...（若缺失将后台自动安装，视频压缩/抽帧需要它）")
+        asyncio.create_task(self._ensure_ffmpeg_async())
+        os.makedirs(self.bili_cache_dir, exist_ok=True)
+        os.makedirs(self.other_cache_dir, exist_ok=True)
+        await self._do_cleanup(self.bili_cache_dir, self.bili_max_cache, self.bili_cleanup, "B站")
+        await self._do_cleanup(self.other_cache_dir, self.other_max_cache, self.other_cleanup, "其他")
+        self._cleanup = asyncio.create_task(self._cleanup_loop())
+        logger.info("[VC] 分析=%s B站=%s | B站缓存=%s | 其他缓存=%s",
+                     self.video_analysis_enabled, self.bili_enabled,
+                     self.bili_cache_dir, self.other_cache_dir)
+
+    async def terminate(self):
+        if self._cleanup and not self._cleanup.done():
+            self._cleanup.cancel()
+            try: await self._cleanup
+            except asyncio.CancelledError: pass
+        self._pending.clear(); self._sessions.clear(); self._sid_sessions.clear()
+
+    # ── 缓存清理（通用） ──
+
+    def _scan_cache(self, cache_dir: str, max_files: int, cleanup_n: int, label: str = ""):
+        """扫描缓存，返回待删除条目列表（文件 + 分析子目录，跳过 .ffmpeg 等隐藏目录）"""
+        try:
+            if not os.path.isdir(cache_dir): return []
+            entries = []
+            for name in os.listdir(cache_dir):
+                if name.startswith("."):
+                    continue  # 跳过 .ffmpeg 等隐藏目录
+                p = os.path.join(cache_dir, name)
+                if os.path.isfile(p) or os.path.isdir(p):
+                    entries.append(name)
+            if len(entries) <= max_files: return []
+            entries.sort(key=lambda n: os.path.getmtime(os.path.join(cache_dir, n)))
+            return entries[:cleanup_n]
+        except Exception as e:
+            logger.warning("[VC] 缓存[%s]扫描异常: %s", label or cache_dir, e)
+            return []
+
+    async def _do_cleanup(self, cache_dir: str, max_files: int, cleanup_n: int, label: str = ""):
+        to_del = self._scan_cache(cache_dir, max_files, cleanup_n, label)
+        if not to_del: return
+        deleted = 0
+        for name in to_del:
+            p = os.path.join(cache_dir, name)
+            try:
+                if os.path.isdir(p):
+                    shutil.rmtree(p, ignore_errors=True)
+                else:
+                    os.remove(p)
+                deleted += 1
+            except: pass
+            await asyncio.sleep(0)
+        try:
+            remain = len([x for x in os.listdir(cache_dir) if not x.startswith(".")])
+        except Exception:
+            remain = 0
+        logger.info("[VC] 缓存清理[%s]: 删%d个余%d个", label or cache_dir, deleted, remain)
+
+    async def _cleanup_loop(self):
+        while True:
+            await asyncio.sleep(300)
+            await self._do_cleanup(self.bili_cache_dir, self.bili_max_cache, self.bili_cleanup, "B站")
+            await self._do_cleanup(self.other_cache_dir, self.other_max_cache, self.other_cleanup, "其他")
+            stale = [k for k, v in self._sessions.items() if v.is_stale(self.session_ttl)]
+            for k in stale:
+                self._sessions.pop(k, None)
+                for sl in self._sid_sessions.values():
+                    if k in sl: sl.remove(k)
+            self._sid_sessions = {k: v for k, v in self._sid_sessions.items() if v}
+
+    def _sid(self, event) -> str:
+        return getattr(event.session, "sid", None) or getattr(event, "sid", "") or ""
+
+    def _is_qq(self, event) -> bool:
+        """判断是否 QQ 平台（platform 来自适配器 manifest.name，内置为 "QQ"，大小写不敏感）"""
+        return str(getattr(event.adapter, "platform", "") or "").strip().lower() == "qq"
+
+    def _ok(self, event) -> bool:
+        if not self.allowed_adapters: return True
+        allow = {str(a).strip().lower() for a in self.allowed_adapters}
+        n = str(getattr(event.adapter, "name", "") or "").strip().lower()
+        p = str(getattr(event.adapter, "platform", "") or "").strip().lower()
+        return n in allow or p in allow
+
+    def _register_session(self, sess, sid):
+        self._sessions[sess.session_id] = sess
+        if sid not in self._sid_sessions: self._sid_sessions[sid] = []
+        lst = self._sid_sessions[sid]
+        if sess.session_id in lst: lst.remove(sess.session_id)
+        lst.insert(0, sess.session_id)
+        if len(lst) > self.max_session_per_user:
+            old = lst.pop(); self._sessions.pop(old, None)
+
+    def _get_by_session_id(self, sid):
+        return self._sessions.get(sid)
+
+    def _list_sessions(self, sid):
+        return [self._sessions[s] for s in self._sid_sessions.get(sid, []) if s in self._sessions]
+
+    # ── 自动发送B站链接（对标音频条 auto_send_link，0 token） ──
+
+    @on.im_message(priority=Priority.HIGH)
+    async def _auto_send_hook(self, event: KiraMessageEvent, *_):
+        if not self.enabled or not self.auto_send_link:
+            return
+        if not self.bili_enabled: return
+        if self.auto_send_allowed_sid and event.session.sid not in self.auto_send_allowed_sid:
+            return
+        if not self._is_qq(event):
+            return
+        sid = event.session.sid or ""
+        if not sid:
+            return
+
+        bvid = ""
+
+        # 1) message.chain 文本搜 BV（纯文本消息）
+        text = "".join(e.text for e in event.message.chain if isinstance(e, Text))
+        if text:
+            m = BVID_RE.search(text)
+            if m: bvid = m.group(0)
+
+        # 2) 文本没有 BV 但 b23 短链 → extract_bvid
+        if not bvid and text:
+            m = re.search(r'b23\.tv/([0-9A-Za-z]+)', text)
+            if m:
+                try: bvid = await extract_bvid(f"https://b23.tv/{m.group(1)}", self.dl_timeout)
+                except: pass
+
+        # 3) raw_message JSON（小程序卡片/app分享的 qqdocurl 里藏 b23）
+        if not bvid:
+            import json as _json
+            raw = getattr(event, "raw_message", None)
+            if raw is None and hasattr(event, "message"):
+                raw = getattr(event.message, "raw_message", None)
+            if raw is None and hasattr(event, "message") and hasattr(event.message, "source_message"):
+                raw = getattr(event.message, "source_message", None)
+            if raw is None:
+                raw = str(event)
+            if isinstance(raw, dict):
+                try: raw = _json.dumps(raw)
+                except: raw = ""
+            if isinstance(raw, str):
+                m = re.search(r'https?://b23\.tv/[0-9A-Za-z]+', raw)
+                if m:
+                    try: bvid = await extract_bvid(m.group(0), self.dl_timeout)
+                    except: pass
+                if not bvid:
+                    m = re.search(r'BV[0-9A-Za-z]{10}', raw)
+                    if m: bvid = m.group(0)
+
+        if not bvid: return
+        logger.info("[VC] auto_send 检测到B站视频: %s", bvid)
+        asyncio.create_task(self._auto_send_do(bvid, event.adapter.name, sid))
+
+    async def _auto_send_do(self, bvid: str, adapter_name: str, sid: str):
+        """异步后台发送，成功后记录 auto_sent 用于 LLM 上下文标注"""
+        try:
+            reply = await self._send_video_by_bvid(None, bvid, sid=sid, adapter_name=adapter_name)
+            if reply and reply.startswith("✅"):
+                # 成功 → 记录 auto_sent，不 discard，消息继续自然流转
+                title = bvid
+                for line in reply.split("\n"):
+                    if "已发送：" in line:
+                        title = line.split("已发送：")[-1].strip()
+                self._auto_sent[sid] = {
+                    "bvid": bvid,
+                    "title": title,
+                    "file_path": reply.split("本地路径:")[-1].strip() if "本地路径:" in reply else "",
+                }
+            elif reply:
+                # 失败 → 补发文字提示
+                await self.ctx.message_processor.send_message_chain(
+                    sid, MessageChain([Text(reply)]))
+        except Exception as e:
+            logger.warning("[VC] auto_send 失败: %s", e)
+            try: await self.ctx.message_processor.send_message_chain(sid, MessageChain([Text(f"❌ 发送B站视频失败: {e}")]))
+            except: pass
+
+    # ── 已直发的 LLM 上下文标注（对齐音频条 inject_auto_sent_note） ──
+
+    @on.llm_request(priority=Priority.LOW)
+    async def _inject_auto_sent_note(self, event: KiraMessageBatchEvent, req: LLMRequest, *_):
+        if not self.enabled: return
+        sid = getattr(event.session, "sid", None)
+        if not sid: return
+        sent = self._auto_sent.pop(sid, None)
+        if not sent: return
+        note = (
+            f"\n[系统提示：该B站视频（《{sent['title']}》"
+            f"BV:{sent['bvid']}）已自动发送压缩版视频（{sent.get('file_path','')}）]"
+        )
+        bvid = sent["bvid"]
+        # 按顺序遍历 messages ↔ user_prompt，定位原始消息追加 note
+        prompt_idx = 0
+        for msg in event.messages:
+            while prompt_idx < len(req.user_prompt) and not (
+                    req.user_prompt[prompt_idx].name == "message"
+                    and req.user_prompt[prompt_idx].source == "system"
+            ):
+                prompt_idx += 1
+            if prompt_idx >= len(req.user_prompt):
+                break
+            p = req.user_prompt[prompt_idx]
+            prompt_idx += 1
+            msg_text = "".join(e.text for e in msg.chain if isinstance(e, Text))
+            if bvid in msg_text:
+                p.content += note
+                break
+
+    # ── Prompt ──
+
+    @on.llm_request(priority=Priority.LOW)
+    async def _inject(self, event, req: LLMRequest, *_):
+        if not self.enabled: return
+        sid = self._sid(event)
+        if not sid: return
+        has_pending = sid in self._pending
+        if not has_pending and not self._sid_sessions.get(sid): return
+        hint = ""
+        if self.video_analysis_enabled and has_pending:
+            url = self._pending[sid].get("url", "")
+            if BILI_RE.search(url):
+                hint = "\n【B站视频】analyze_video / send_video / search_bili_video"
+            else:
+                hint = "\n【视频】analyze_video 分析内容"
+        if hint:
+            for p in req.system_prompt:
+                if p.name and "tool" in p.name.lower():
+                    p.content += hint; break
+            else:
+                if req.system_prompt: req.system_prompt[-1].content += hint
+
+    # ── 视频检测 ──
+
+    @on.im_message(priority=Priority.HIGH)
+    async def _detect(self, event: KiraMessageEvent, *_):
+        if not self.enabled or not self._ok(event) or not self._is_qq(event):
+            return
+        sid = self._sid(event)
+        url = None
+
+        # 1) 消息链里的 Video 元素（QQ 适配器已解析好，最可靠）
+        try:
+            for ele in getattr(event.message, "chain", None) or []:
+                if type(ele).__name__ == "Video":
+                    f = getattr(ele, "file", "") or ""
+                    if f:
+                        url = str(f)
+                        break
+        except Exception:
+            pass
+
+        # 2) raw_message（OneBot 原始结构）里找 video 段
+        raw = None
+        if not url:
+            for a in ("raw_message", "source_message", "original_message"):
+                v = getattr(event.message, a, None) or getattr(event, a, None)
+                if v:
+                    if isinstance(v, str):
+                        try: raw = json.loads(v)
+                        except: continue
+                    elif isinstance(v, (dict, list)): raw = v
+                    if raw: break
+            segs = None
+            if isinstance(raw, dict):
+                segs = raw.get("message")
+            elif isinstance(raw, list):
+                segs = raw
+            if isinstance(segs, list):
+                for s in segs:
+                    if isinstance(s, dict) and s.get("type") == "video":
+                        d = s.get("data") or {}
+                        url = d.get("url") or ""
+                        break
+
+        # 3) 兜底：调用 get_msg 重新取一次
+        if not url:
+            try:
+                ad = self.ctx.adapter_mgr.get_adapter(event.adapter.name)
+                cl = ad.get_client()
+                mid = getattr(event.message, "message_id", None) or getattr(event, "message_id", None)
+                if mid:
+                    rm = await cl.send_action("get_msg", {"id": mid})
+                    if isinstance(rm, dict):
+                        for s in rm.get("message", []):
+                            if isinstance(s, dict) and s.get("type") == "video":
+                                url = (s.get("data") or {}).get("url", ""); break
+            except: pass
+        if url:
+            self._pending[sid] = {"url": url, "source": "onebot", "ts": time.time()}
+
+    # ────────────── 工具1：search_bili_video ──────────────
+
+    @register.tool(
+        name="search_bili_video",
+        description="搜索B站视频，返回结果列表（含标题/UP主/时长/播放量/简介）。用户要找B站视频时调用。",
+        params={
+            "type": "object",
+            "properties": {"keyword": {"type": "string", "description": "搜索关键词"}},
+            "required": ["keyword"],
+        },
+    )
+    async def _tool_search(self, event, keyword: str) -> str:
+        if not self.bili_enabled: return "B站功能未启用"
+        try: rs = await search_bili(keyword, self.bili_search_n, self.bili_cookie)
+        except Exception as e: return f"⚠️ 搜索失败：{e}"
+        if not rs: return "未找到相关视频"
+        lines = [f"🔍 搜索「{keyword}」结果："]
+        for i, r in enumerate(rs, 1):
+            d = r.get("duration", 0); desc = r.get("desc", "")
+            lines.append(f"{i}. {r.get('title','')}\n   👤 {r.get('author','')} | ⏱ {d//60}:{d%60:02d} | 👁 {r.get('play',0)}\n   BV: {r.get('bvid','')}")
+            if desc and self.search_show_desc: lines.append(f"   📝 {desc[:self.search_desc_max_chars]}")
+        lines.append("\n→ send_video(bvid=...) 直接发送\n→ analyze_video(bvid=...) 分析")
+        return "\n".join(lines)
+
+    # ────────────── 工具2：send_video ──────────────
+
+    @register.tool(
+        name="send_video",
+        description="下载B站视频并发送到QQ（可压缩），也支持本地视频路径发送。用户要求下载/发B站视频时调用。传关键词返回候选列表。",
+        params={
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "B站链接/BV号/搜索关键词"},
+                "bvid": {"type": "string", "description": "已知BV号（优先）"},
+                "local_path": {"type": "string", "description": "本地视频路径（绝对路径或相对 data/ 目录的相对路径）"},
+                "quality": {"type": "string", "description": "质量: low|medium|original", "default": ""},
+            },
+        },
+    )
+    async def _tool_send_video(self, event, target: str = "", bvid: str = "", local_path: str = "", quality: str = "") -> str:
+        if not self._is_qq(event): return "当前不是QQ"
+        sid = self._sid(event)
+        if local_path:
+            # 本地文件（绝对路径直用，相对路径基于 get_data_path() 解析）
+            lp = local_path.strip()
+            if os.path.isabs(lp) and os.path.isfile(lp): pass
+            else:
+                # 相对路径 → 以 get_data_path() 为基准
+                resolved = os.path.join(get_data_path(), lp)
+                if os.path.isfile(resolved): lp = resolved
+                else: return f"⚠️ 找不到文件: {local_path}（相对路径以 data/ 为基准）"
+            q = quality or self.send_video_quality
+            # 压缩
+            os.makedirs(self.other_cache_dir, exist_ok=True)
+            out_path = os.path.join(self.other_cache_dir, f"send_local_{Path(lp).stem}.mp4")
+            try:
+                if q == "low": await compress_video(lp, out_path, max_width=360, crf=32)
+                elif q == "medium": await compress_video(lp, out_path, max_width=720, crf=28)
+                elif q == "original": out_path = lp
+                else: await compress_video(lp, out_path, max_width=720, crf=28)
+            except: out_path = lp
+            try:
+                ad = self.ctx.adapter_mgr.get_adapter(event.adapter.name)
+                cl = ad.get_client()
+                if "gm:" in sid:
+                    await cl.send_action("send_group_msg", {"group_id": int(sid.split(":")[-1]), "message": [{"type": "video", "data": {"file": out_path}}]})
+                elif "dm:" in sid:
+                    await cl.send_action("send_private_msg", {"user_id": int(sid.split(":")[-1]), "message": [{"type": "video", "data": {"file": out_path}}]})
+                else: return "无法判断群聊/私聊"
+            except Exception as e: return f"⚠️ 发送失败：{e}"
+            return f"✅ 已发送本地视频：{Path(lp).name} | 质量: {q}"
+        if bvid:
+            bv = bvid.strip()
+            if not bv.startswith("BV"): bv = (await extract_bvid(bv)) or ""
+            if bv: return await self._send_video_by_bvid(event, bv, quality)
+        if target:
+            bv = await extract_bvid(target, self.dl_timeout)
+            if bv: return await self._send_video_by_bvid(event, bv, quality)
+        keyword = (target or "").strip()
+        if not keyword: return "请提供B站链接/BV号/搜索关键词"
+        try: rs = await search_bili(keyword, self.bili_search_n, self.bili_cookie)
+        except Exception as e: return f"⚠️ 搜索失败：{e}"
+        if not rs: return f"未找到「{keyword}」相关视频"
+        lines = [f"🔍 搜索「{keyword}」结果："]
+        for i, r in enumerate(rs, 1):
+            d = r.get("duration", 0); desc = r.get("desc", "")
+            lines.append(f"{i}. {r.get('title','')}\n   👤 {r.get('author','')} | ⏱ {d//60}:{d%60:02d} | 👁 {r.get('play',0)}")
+            if desc and self.search_show_desc: lines.append(f"   📝 {desc[:self.search_desc_max_chars]}")
+            lines.append(f"   BV: {r.get('bvid','')}")
+        lines.append("\n→ send_video(bvid=BVxxx)")
+        return "\n".join(lines)
+
+    async def _send_video_by_bvid(self, event, bvid: str, quality: str = "", sid: str = "", adapter_name: str = "") -> str:
+        """发送B站视频到QQ（内置 NapCat 分块上传防断连）
+        event 可为 None（auto_send 钩子 discard 后用 adapter_name 参数代替）
+        """
+        try: info = await get_bili_info(bvid, self.bili_cookie)
+        except Exception as e: return f"⚠️ 获取信息失败：{e}"
+        d = info.get("duration", 0); title = info.get("title", bvid)
+        if self.bili_max_dl and d > self.bili_max_dl:
+            return f"⏱ 「{title}」时长{d}s超上限，不下发"
+        os.makedirs(self.bili_cache_dir, exist_ok=True)
+        q = quality or self.bili_download_quality
+        try:
+            path, _ = await download_bili_video(bvid, self.bili_cache_dir, info=info,
+                cookie=self.bili_cookie, timeout=self.dl_timeout, max_seconds=self.bili_max_dl,
+                quality=q)
+        except Exception as e: return f"⚠️ 下载失败：{e}"
+        # 下载后是否再压缩：只在 compress_quality 比下载质量更低时才有意义
+        _rank = {"low": 1, "medium": 2, "original": 3}
+        cq = self.bili_compress_quality
+        if cq and cq != "original" and _rank.get(cq, 3) < _rank.get(q, 3):
+            try:
+                compressed = os.path.join(self.bili_cache_dir, f"send_{bvid}_compressed.mp4")
+                if cq == "low": await compress_video(path, compressed, max_width=360, crf=32)
+                elif cq == "medium": await compress_video(path, compressed, max_width=720, crf=28)
+                out_path = compressed
+            except:
+                out_path = path
+        else:
+            out_path = path
+
+        send_sid = sid or (self._sid(event) if event else "")
+        if not send_sid: return "⚠️ 无法获取会话ID"
+        ad_name = adapter_name or (event.adapter.name if event and hasattr(event, 'adapter') else "")
+        if not ad_name: return "⚠️ 无法获取 adapter"
+        try:
+            ad = self.ctx.adapter_mgr.get_adapter(ad_name)
+            cl = ad.get_client()
+            is_group = "gm:" in send_sid
+            target_id = int(send_sid.split(":")[-1])
+
+            # ── NapCat 大文件分块上传（可选扩展，官方 NapCat 无此 action，不支持则降级） ──
+            file_ref = out_path  # 兜底：直接发本地路径（NapCat 可读本地文件）
+            try:
+                file_size = Path(out_path).stat().st_size
+            except Exception:
+                file_size = 0
+            if file_size > 1024 * 1024 and not self._stream_unsupported:
+                try:
+                    filename = f"{bvid}.mp4"
+                    chunk_size = 512 * 1024
+                    total_chunks = max(1, math.ceil(file_size / chunk_size))
+                    stream_id = uuid.uuid4().hex
+                    digest = hashlib.sha256()
+                    with open(out_path, "rb") as f:
+                        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                            digest.update(chunk)
+                    sha256 = digest.hexdigest()
+                    retention = 600000
+                    with open(out_path, "rb") as f:
+                        for ci in range(total_chunks):
+                            chunk = f.read(chunk_size)
+                            if not chunk: break
+                            _raise_for_stream(await cl.send_action("upload_file_stream", {
+                                "stream_id": stream_id, "chunk_index": ci,
+                                "total_chunks": total_chunks, "file_size": file_size,
+                                "filename": filename, "expected_sha256": sha256,
+                                "file_retention": retention,
+                                "chunk_data": base64.b64encode(chunk).decode("ascii"),
+                            }, timeout=120))
+                    resp = await cl.send_action("upload_file_stream", {
+                        "stream_id": stream_id, "is_complete": True,
+                        "total_chunks": total_chunks, "file_size": file_size,
+                        "filename": filename, "expected_sha256": sha256,
+                        "file_retention": retention,
+                    }, timeout=120)
+                    _raise_for_stream(resp)
+                    napcat_path = _extract_stream_path(resp)
+                    if napcat_path:
+                        file_ref = napcat_path
+                except Exception as e:
+                    msg = str(e).lower()
+                    if "不支持" in msg or "unsupported" in msg or "unknown action" in msg or "not found" in msg:
+                        self._stream_unsupported = True  # 记住：本次运行不再尝试
+                    logger.info("[VC] stream 上传不可用，降级直接发路径: %s", e)
+
+            # 发送视频（file_ref 是 NapCat 引用路径或本地路径）
+            if is_group:
+                await cl.send_action("send_group_msg", {
+                    "group_id": target_id,
+                    "message": [{"type": "video", "data": {"file": file_ref, "name": f"{bvid}.mp4"}}],
+                })
+            else:
+                await cl.send_action("send_private_msg", {
+                    "user_id": target_id,
+                    "message": [{"type": "video", "data": {"file": file_ref, "name": f"{bvid}.mp4"}}],
+                })
+        except Exception as e:
+            return f"⚠️ 发送失败：{e}"
+        return f"✅ 已发送：{title}\nBV: {bvid} | ⏱ {d//60}:{d%60:02d} | 质量: {q}\n📁 本地路径: {out_path}"
+    # ────────────── 工具3：analyze_video（分析开关控制） ──────────────
+
+    @register.tool(
+        name="analyze_video",
+        description=("分析视频内容。支持QQ视频/B站视频/本地路径。首次返回session_id，追问传回。"
+                     "只看某一段时间就传 start_sec/end_sec（数字秒）；一次看多段传 segments=[[起,止],...]（最多5段、每段≤300秒）。"
+                     "时间段分析会复用已下载的视频，不会重新下载。"),
+        params={
+            "type": "object",
+            "properties": {
+                "question": {"type": "string", "description": "留空=完整分析"},
+                "bvid": {"type": "string", "description": "B站BV号"},
+                "deep_analysis": {"type": "boolean", "description": "深度视觉分析", "default": False},
+                "local_path": {"type": "string", "description": "本地视频路径"},
+                "session_id": {"type": "string", "description": "追问用session_id"},
+                "start_sec": {"type": "number", "description": "只分析从第几秒开始（数字秒）", "default": 0},
+                "end_sec": {"type": "number", "description": "分析到第几秒结束；传 0 = 到视频结尾", "default": 0},
+                "segments": {
+                    "type": "array",
+                    "description": "多段分析：[[起秒,止秒],[起秒,止秒]]，最多5段、每段≤300秒",
+                    "items": {"type": "array", "items": {"type": "number"}},
+                },
+            },
+        },
+    )
+    async def _tool_analyze(self, event, question: str = "", bvid: str = "",
+                             deep_analysis: bool = False, local_path: str = "",
+                             session_id: str = "",
+                             start_sec: float = 0, end_sec: float = 0,
+                             segments=None) -> str:
+        if not self.video_analysis_enabled:
+            return "⚠️ 视频分析功能已关闭，可在 WebUI 启用"
+
+        segs, err = self._parse_segments(start_sec, end_sec, segments)
+        if err: return f"⚠️ {err}"
+
+        sid = self._sid(event)
+        if not sid: return "无法获取会话ID"
+
+        if session_id:
+            sess = self._get_by_session_id(session_id)
+            if not sess: return f"⚠️ session_id={session_id} 不存在"
+            self._register_session(sess, sid)
+            if segs: return await self._segment_analyze(sess, question, segs)
+            if question: return await self._followup(sess, question)
+            return f"📌 session_id={session_id}\n🤖 {sess.analysis_model}\n━━━\n{sess.analysis[:500]}\n━━━\n追问用 session_id=\"{session_id}\""
+
+        source_url = ""; source_type = ""
+
+        if bvid:
+            bvid = bvid.strip()
+            if not bvid.startswith("BV"): bvid = (await extract_bvid(bvid)) or ""
+            if bvid: source_type = "bilibili"; source_url = f"https://www.bilibili.com/video/{bvid}"
+        elif local_path:
+            lp = local_path.strip()
+            if os.path.isabs(lp) and os.path.isfile(lp): source_url = lp
+            else:
+                resolved = os.path.join(get_data_path(), lp)
+                if os.path.isfile(resolved): source_url = resolved
+                else: return f"⚠️ 找不到文件: {local_path}（相对路径以 data/ 为基准）"
+            source_type = "local"
+        else:
+            pend = self._pending.pop(sid, None)
+            if pend:
+                source_url = pend["url"]; source_type = "onebot"
+                m = BVID_RE.search(source_url)
+                if m: bvid = m.group(0); source_type = "bilibili"
+            else:
+                olds = self._list_sessions(sid)
+                if olds:
+                    cur = olds[0]
+                    if question: return await self._followup(cur, question)
+                    return f"🔁 已有{len(olds)}个历史，最新session_id={cur.session_id}\n🤖 {cur.analysis_model}\n━━━\n{cur.analysis[:300]}\n━━━\n追问用 session_id=\"{cur.session_id}\""
+                return "当前无视频"
+
+        sess_id = hashlib.md5(source_url.encode()).hexdigest()[:12]
+        if sess_id in self._sessions:
+            cur = self._sessions[sess_id]
+            self._register_session(cur, sid)
+            if segs: return await self._segment_analyze(cur, question, segs)
+            if question: return await self._followup(cur, question)
+            if deep_analysis and cur.analysis_mode == "AI_summary" and not cur.grids_base64:
+                return await self._deep(cur)
+            return f"🔁 已有分析\n📌 session_id={sess_id}\n🤖 {cur.analysis_model}\n━━━\n{cur.analysis[:400]}\n━━━\n追问用 session_id=\"{sess_id}\""
+
+        if source_type == "bilibili" and self.bili_use_ai and not deep_analysis and not segs:
+            try:
+                info = await get_bili_info(bvid, self.bili_cookie)
+                ai = await get_ai_summary(bvid, info["cid"], info.get("up_mid", 0), self.bili_cookie)
+                if ai.get("has_summary"): return self._build_ai_result(sess_id, sid, source_url, info, ai)
+            except Exception as e: logger.info("[VC] B站AI降级: %s", e)
+
+        return await self._vision(sess_id, sid, source_type, source_url, bvid,
+                                   question or "请完整分析这段视频", segments=segs)
+
+    # ── 时间段参数解析 ──
+
+    def _parse_segments(self, start_sec, end_sec, segments):
+        """归一化时间段参数 → ([(s,e), ...] | None, 错误信息)
+
+        segments 优先于 start_sec/end_sec；end_sec=0 表示到视频结尾。
+        未指定时返回 (None, "")，由下游按全片处理。
+        """
+        raw = []
+        if segments:
+            items = segments
+            if isinstance(segments, str):
+                # 容错："10-30,100-130" / "10~30；100~130"
+                items = []
+                for part in re.split(r"[,;，；]", segments):
+                    m = re.match(r"\s*([\d.]+)\s*[-~到至]\s*([\d.]+)\s*$", part)
+                    if m: items.append((m.group(1), m.group(2)))
+            if isinstance(items, (list, tuple)):
+                for item in items:
+                    try:
+                        if isinstance(item, dict):
+                            s = item.get("start", item.get("start_sec", item.get("from")))
+                            e = item.get("end", item.get("end_sec", item.get("to")))
+                        else:
+                            s, e = item[0], item[1]
+                        raw.append((float(s), float(e)))
+                    except Exception:
+                        continue
+        elif start_sec or end_sec:
+            try:
+                raw.append((float(start_sec or 0), float(end_sec or 0)))
+            except Exception:
+                return None, "时间段参数格式不对（应为数字秒）"
+
+        if not raw:
+            return None, ""
+
+        norm = []
+        for s, e in raw:
+            s = max(0.0, s)
+            if e <= 0: e = 1e9        # 到结尾，稍后按视频时长截断
+            if e <= s:
+                return None, f"时间段非法：{s:.0f}~{e:.0f}（结束必须大于开始）"
+            if e < 1e9 and (e - s) > MAX_SEGMENT_SEC:
+                return None, (f"单段最长 {MAX_SEGMENT_SEC} 秒，请把 {s:.0f}~{e:.0f} "
+                              f"拆成多段传 segments")
+            norm.append((s, e))
+        if len(norm) > MAX_SEGMENTS:
+            return None, f"最多 {MAX_SEGMENTS} 段，当前 {len(norm)} 段"
+        return norm, ""
+
+    # ── B站AI总结 ──
+
+    def _build_ai_result(self, sess_id, sid, url, info, ai):
+        sess = VideoSession(sess_id, sid, "bilibili", url)
+        sess.title = info.get("title", ""); sess.duration = info.get("duration", 0)
+        sess.bili_ai_summary = ai; self._register_session(sess, sid)
+        s = ai.get("summary", "")
+        outline = "\n".join(
+            f"  [{_ts(o.get('timestamp',0))}] {o.get('title','')}\n" +
+            "\n".join(f"    → [{_ts(p.get('timestamp',0))}] {p.get('content','')}"
+                      for p in o.get("part_outline", []))
+            for o in ai.get("outline", []))
+        result = (f"🎬 {info.get('title','')}\n📌 session_id={sess_id}\n━━━\n"
+                  f"⏱ {info.get('duration',0)}s | 🤖 B站AI总结\n━━━\n{s}\n")
+        if outline: result += f"\n📑 大纲\n{outline}\n"
+        result += f"\n━━━\n💡 追问用 session_id=\"{sess_id}\""
+        sess.analysis = result; sess.analysis_model = "B站AI总结"; sess.analysis_mode = "AI_summary"
+        return result
+
+    # ── 视觉分析（非B站视频存到 other_cache_dir） ──
+
+    async def _vision(self, sess_id, sid, stype, surl, bvid, question, segments=None):
+        if not self._profiles: return "未配置模型"
+
+        # 选模型用的时长：指定片段时用片段总长，否则用视频真实时长
+        duration_hint = self.max_duration
+        if segments:
+            duration_hint = sum(e - s for s, e in segments)
+        elif stype == "bilibili" and bvid:
+            try:
+                _info = await get_bili_info(bvid, self.bili_cookie)
+                duration_hint = float(_info.get("duration") or 0) or self.max_duration
+            except Exception:
+                pass
+        elif stype == "local" and os.path.isfile(surl):
+            try:
+                from video_processor import _get_video_info
+                duration_hint = float(_get_video_info(surl).get("duration") or 0) or self.max_duration
+            except Exception:
+                pass
+        profile = select_model(self._profiles, duration_hint, self.default_model)
+        if not profile: return "无合适模型"
+
+        if stype == "bilibili" and bvid:
+            # B站: 源文件存在 bili_cache_dir
+            os.makedirs(self.bili_cache_dir, exist_ok=True)
+            try:
+                raw_path, info = await download_bili_video(bvid, self.bili_cache_dir, cookie=self.bili_cookie,
+                    timeout=self.dl_timeout, max_seconds=self.bili_max_dl,
+                    quality=self.bili_download_quality)
+            except Exception as e: return f"⚠️ 下载失败：{e}"
+            # 分析工作也放 bili_cache_dir
+            work = os.path.join(self.bili_cache_dir, f"analysis_{sess_id}")
+        else:
+            # 非B站（QQ/本地）：存到 other_cache_dir
+            os.makedirs(self.other_cache_dir, exist_ok=True)
+            raw_path = surl
+            work = os.path.join(self.other_cache_dir, f"analysis_{sess_id}")
+            if stype == "local":
+                raw_path = surl
+
+        os.makedirs(work, exist_ok=True)
+        # native + 上传模式：小文件不预压缩（保画质）；阈值 0 = 永不压缩（用极大值让所有文件都跳过）
+        native_upload = bool(self.upload_enabled and profile.mode == "native")
+        under_mb = 0
+        if native_upload:
+            under_mb = self.upload_compress_over_mb if self.upload_compress_over_mb > 0 else 10 ** 6
+        result = await process_video(raw_path, work_dir=work,
+            max_file_mb=self.max_file_mb, max_duration_sec=self.max_duration,
+            download_timeout=self.dl_timeout,
+            target_frames=self.target_frames, scene_threshold=self.scene_threshold,
+            max_per_grid=self.max_per_grid, grid_cols=self.grid_cols,
+            cell_width=self.cell_width, cell_ratio=self.cell_ratio,
+            segments=[[s, e] for s, e in segments] if segments else None,
+            skip_compress=bool(segments),
+            skip_compress_if_under_mb=under_mb)
+        if result["status"] == "rejected": return f"⚠️ {result['error']}"
+        if result["status"] == "error": return f"⚠️ 处理失败：{result['error']}"
+
+        sess = VideoSession(sess_id, sid, stype, surl) if sess_id not in self._sessions else self._sessions[sess_id]
+        sess.compressed_path = result.get("compressed_path", "")
+        sess.duration = result.get("duration", 0)
+        sess.grids_base64 = result.get("grids_base64", [])
+        sess.scene_count = result.get("scene_count", 0); sess.total_frames = result.get("total_frames", 0)
+        sess.timestamps = result.get("timestamps", [])
+        sess.file_size_mb = result.get("file_size_mb", 0); sess.compressed_size_mb = result.get("compressed_size_mb", 0)
+        self._register_session(sess, sid)
+
+        real_segs = [(s, e) for s, e in (result.get("segments") or [])]
+        analysis, label, downgrade_note = await self._analyze_result(
+            profile, result, real_segs, question, work)
+        sess.analysis = analysis; sess.analysis_model = label; sess.analysis_mode = profile.mode
+
+        range_line = self._range_line(real_segs, result.get("duration", 0))
+        return (f"🎬 视频分析完成\n📌 session_id={sess_id}\n━━━\n"
+                f"{range_line}"
+                f"⏱ {result['duration']:.1f}s | 📐 {result.get('width','?')}×{result.get('height','?')}\n"
+                f"📦 {result['file_size_mb']:.1f}MB→{result['compressed_size_mb']:.1f}MB\n"
+                f"🖼 {result['total_frames']}帧/{result['grid_count']}张/{result['scene_count']}场景\n"
+                f"🤖 {label}\n━━━\n{analysis}{downgrade_note}\n━━━\n💡 追问用 session_id=\"{sess_id}\"")
+
+    # ── 时间段分析（复用已下载的视频） ──
+
+    def _range_line(self, segs, duration: float) -> str:
+        """结果头部的分析范围标注"""
+        if not segs or (len(segs) == 1 and segs[0][0] <= 0.05 and segs[0][1] >= duration - 0.5):
+            return ""
+        if len(segs) == 1:
+            return f"🔍 分析范围: {_ts(segs[0][0])} - {_ts(segs[0][1])}\n"
+        return ("🔍 分析范围: " + str(len(segs)) + " 段 " +
+                " ".join(f"[{_ts(s)}-{_ts(e)}]" for s, e in segs) + "\n")
+
+    async def _analyze_result(self, profile, result, segs, question, work):
+        """按 模式 + 段数 选择分析路径，返回 (analysis, label, note)。
+
+        - native + 单段 → 秒切该段片段（含音频）传给模型
+        - 其他（frames / native 多段）→ 拼图帧模式
+        - native 失败自动降级 frames
+        """
+        meta = build_meta(result["duration"], result["total_frames"],
+                          result["grid_count"], result["scene_count"],
+                          result.get("timestamps", []))
+        multi = len(segs) > 1
+        src_for_native = result.get("compressed_path") or ""
+        # 全片（未指定时间段）还是指定区间？全片直接用压缩后的整段视频，不做秒切
+        is_full = (not segs) or (len(segs) == 1
+                                 and segs[0][0] <= 0.5
+                                 and segs[0][1] >= result.get("duration", 0) - 0.5)
+
+        async def _native_payload():
+            """返回 (视频路径, 附加说明)。全片=压缩后的完整视频；单段=秒切片段。"""
+            if is_full:
+                return src_for_native, ""
+            s, e = segs[0]
+            clip_path = os.path.join(work, "clip.mp4")
+            clip_path, real_dur, actual_start = await clip_video(src_for_native, clip_path, s, e)
+            clip_note = (f"\n（秒切对齐关键帧，实际片段约 {_ts(actual_start)} - "
+                         f"{_ts(actual_start + real_dur)}）") if abs(actual_start - s) > 0.3 else ""
+            return clip_path, clip_note
+
+        async def _upload_or_none(path: str):
+            """尝试把视频换成公开链接；未启用/超限/失败都返回 None（回退 base64）"""
+            if not self.upload_enabled:
+                return None
+            try:
+                size_mb = os.path.getsize(path) / (1024 * 1024)
+                if size_mb > self.upload_max_mb:
+                    logger.info("[VC] 文件 %.1fMB 超过上传上限 %dMB，改用 base64",
+                                size_mb, self.upload_max_mb)
+                    return None
+                key = f"{path}:{os.path.getmtime(path):.0f}"
+                if key in self._upload_cache:
+                    return self._upload_cache[key]
+                t0 = time.time()
+                url, used_host = await upload_to_any(path, self.upload_hosts,
+                                                     timeout=self.upload_timeout,
+                                                     keep_name=self.upload_keep_name,
+                                                     use_proxy=self.upload_use_proxy)
+                self._upload_cache[key] = url
+                logger.info("[VC] 视频已上传（%.1fMB, %.1fs, %s）→ %s",
+                            size_mb, time.time() - t0, used_host, url)
+                return url
+            except UploadError as e:
+                logger.warning("[VC] 上传失败，回退 base64: %s", e)
+                return None
+            except Exception as e:
+                logger.warning("[VC] 上传异常，回退 base64: %s", e)
+                return None
+
+        async def _native_call():
+            vpath, clip_note = await _native_payload()
+            size_mb = os.path.getsize(vpath) / (1024 * 1024)
+            # 超过阈值 → 上传前先压（体积可控）；≤阈值 → 直接传，保住画质
+            if self.upload_enabled and self.upload_compress_over_mb > 0 \
+                    and size_mb > self.upload_compress_over_mb:
+                try:
+                    small = os.path.join(work, "upload_small.mp4")
+                    t0 = time.time()
+                    await compress_video(vpath, small, max_width=720, crf=28)
+                    new_mb = os.path.getsize(small) / (1024 * 1024)
+                    logger.info("[VC] 上传前压缩 %.1fMB → %.1fMB（%.1fs）",
+                                size_mb, new_mb, time.time() - t0)
+                    vpath, size_mb = small, new_mb
+                except Exception as e:
+                    logger.warning("[VC] 上传前压缩失败，按原文件上传: %s", e)
+            url = await _upload_or_none(vpath)
+            if not url and size_mb > NATIVE_MAX_MB:
+                # 没上传成功且超过 base64 上限 → 压到能内联
+                try:
+                    small = os.path.join(work, "native_small.mp4")
+                    await compress_video(vpath, small, max_width=720, crf=30)
+                    vpath = small
+                except Exception as e:
+                    logger.warning("[VC] base64 回退压缩失败: %s", e)
+            ans = await analyze_native(profile, vpath, question, self.default_prompt,
+                                       video_url=url)
+            tag = "native URL" if url else "native base64"
+            if not is_full:
+                tag += " 片段"
+            return ans, clip_note, tag
+
+        # native（全片或单段都走；多段走帧模式）
+        if profile.mode == "native" and not multi:
+            try:
+                analysis, clip_note, tag = await _native_call()
+                return analysis, f"{profile.name} ({tag})", clip_note
+            except Exception as e:
+                logger.warning("[VC] native 模式失败，降级帧模式: %s", e)
+                if not result.get("grids_base64"):
+                    return f"⚠️ AI分析失败（{type(e).__name__}）", f"{profile.name} (native)", ""
+                try:
+                    analysis = await analyze_frames(profile, result["grids_base64"], meta,
+                                                    question, self.default_prompt)
+                    return (analysis, f"{profile.name} (native→frames)",
+                            f"\n（原生视频模式失败，已降级为帧模式：{str(e)[:120]}）")
+                except Exception as e2:
+                    logger.error("[VC] LLM失败: %s", e2)
+                    return (f"⚠️ AI分析失败（native: {type(e).__name__} / frames: {type(e2).__name__}）",
+                            f"{profile.name} (native)", "")
+
+        # frames 路径（含 native 多段：一次请求覆盖所有段）
+        try:
+            analysis = await analyze_frames(profile, result["grids_base64"], meta,
+                                            question, self.default_prompt)
+            label = f"{profile.name} (frames" + (" 多段)" if multi else ")")
+            note = "\n（多段分析走帧模式：一次请求覆盖所有段）" if (multi and profile.mode == "native") else ""
+            return analysis, label, note
+        except Exception as e:
+            logger.error("[VC] LLM失败: %s", e)
+            return f"⚠️ AI分析失败（{type(e).__name__}）", f"{profile.name} (frames)", ""
+
+    async def _segment_analyze(self, sess, question, segs):
+        """对已有 session 的视频做指定时间段分析（用本地文件，不重新下载）"""
+        path = sess.compressed_path
+        if not path or not os.path.isfile(path):
+            return ("⚠️ 本地视频文件已失效（可能被缓存清理），请重新发送或重新分析该视频")
+        if not self._profiles:
+            return "未配置模型"
+
+        # 按视频实际时长截断
+        real = []
+        for s, e in segs:
+            e2 = min(e, sess.duration) if sess.duration else e
+            if e2 - s >= 0.05:
+                real.append((s, e2))
+        if not real:
+            return (f"⚠️ 时间段超出视频时长（视频共 {sess.duration:.1f}s）")
+        total = sum(e - s for s, e in real)
+        profile = select_model(self._profiles, total, self.default_model) or self._profiles[0]
+
+        work = os.path.join(os.path.dirname(path), f"seg_{int(time.time()*1000) % 10**9}")
+        os.makedirs(work, exist_ok=True)
+        result = await process_video(path, work_dir=work,
+            max_file_mb=max(self.max_file_mb, 4096),
+            max_duration_sec=max(self.max_duration, int(sess.duration) + 1),
+            download_timeout=self.dl_timeout,
+            target_frames=self.target_frames, scene_threshold=self.scene_threshold,
+            max_per_grid=self.max_per_grid, grid_cols=self.grid_cols,
+            cell_width=self.cell_width, cell_ratio=self.cell_ratio,
+            segments=[[s, e] for s, e in real], skip_compress=True)
+        if result["status"] != "ok":
+            return f"⚠️ 处理失败：{result.get('error', result['status'])}"
+
+        analysis, label, note = await self._analyze_result(profile, result, real, question, work)
+        sess.add_turn(question or "(时间段分析)", analysis)
+        range_line = self._range_line(real, sess.duration)
+        return (f"🎬 时间段分析完成\n📌 session_id={sess.session_id}\n━━━\n"
+                f"{range_line}"
+                f"🖼 {result['total_frames']}帧/{result['grid_count']}张\n"
+                f"🤖 {label}\n━━━\n{analysis}{note}\n━━━\n"
+                f"💡 继续追问用 session_id=\"{sess.session_id}\"")
+
+    async def _deep(self, sess):
+        bvid = BVID_RE.search(sess.source_url)
+        return await self._vision(sess.session_id, sess.sid, "bilibili", sess.source_url,
+                                   bvid.group(0) if bvid else "",
+                                   "对B站AI总结做补充，深入分析画面")
+
+    async def _followup(self, sess, question):
+        if not question: return f"当前 session={sess.session_id}\n{sess.analysis[:300]}\n追问用 session_id=\"{sess.session_id}\""
+        if not sess.grids_base64:
+            return f"只有{sess.analysis_mode}结果，深度分析后可追问画面。\n已有: {sess.analysis[:200]}"
+        profile = select_model(self._profiles, sess.duration, self.default_model) or (
+            self._profiles[0] if self._profiles else None)
+        if not profile: return "无可用模型"
+        meta = build_meta(sess.duration, sess.total_frames, len(sess.grids_base64),
+                          sess.scene_count, sess.timestamps)
+        ctx = f"之前: {sess.analysis[:500]}\n\n追问: {question}\n\n基于帧回答指出时间。"
+        try:
+            ans = await analyze_frames(profile, sess.grids_base64, meta, ctx, "")
+        except Exception as e: ans = f"⚠️ 追问失败: {type(e).__name__}: {e}"
+        sess.add_turn(question, ans)
+        return f"🤖 {profile.name} | session={sess.session_id}\n━━━\n{ans}"
+
+    def reload_cfg(self, cfg: dict):
+        """热重载配置：只重读配置项，保留会话、缓存任务与已探测状态"""
+        try:
+            self._load_cfg(cfg)
+        except Exception as e:
+            logger.error("[VC] 配置热重载失败: %s", e)
+
+
+def _ts(s: float) -> str:
+    return f"{int(s//60):02d}:{s - int(s//60)*60:06.3f}"
+
+
+# ── NapCat stream 工具函数（模块级，供类内方法调用） ──────────
+
+def _raise_for_stream(resp):
+    if not isinstance(resp, dict):
+        raise RuntimeError(f"stream response: {resp!r}")
+    if resp.get("status") == "ok":
+        return
+    msg = (str(resp.get("data", {})) if isinstance(resp.get("data"), dict) else str(resp))[:200]
+    if "unsupported" in msg.lower() or "not found" in msg.lower() or "unknown action" in msg.lower():
+        raise RuntimeError(f"NapCat 不支持 upload_file_stream: {msg}")
+    raise RuntimeError(f"stream 上传失败: {msg}")
+
+
+def _extract_stream_path(resp) -> Optional[str]:
+    data = resp.get("data")
+    if isinstance(data, dict):
+        for k in ("file_path", "path", "file"):
+            v = data.get(k)
+            if v: return str(v)
+    for k in ("file_path", "path", "file"):
+        v = resp.get(k)
+        if v: return str(v)
+    return None

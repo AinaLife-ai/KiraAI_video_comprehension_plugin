@@ -1,0 +1,8 @@
+# Python 依赖
+openai>=1.0.0
+httpx>=0.27.0
+Pillow>=10.0.0
+
+# 系统依赖（需 apk add）：
+# ffmpeg ffmpeg-libavcodec — 视频压缩和抽帧
+# 安装命令：apk add ffmpeg ffmpeg-libavcodec
