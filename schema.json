@@ -1,0 +1,576 @@
+{
+  "section_basic": {
+    "type": "section",
+    "name": "基础设置",
+    "collapsed": false,
+    "fields": {
+      "enabled": {
+        "type": "switch",
+        "name": "启用插件",
+        "default": true
+      },
+      "video_analysis_enabled": {
+        "type": "switch",
+        "name": "启用视频分析功能",
+        "default": false,
+        "hint": "关掉后 analyze_video 工具不可用，send_video / search_bili_video 仍可用"
+      },
+      "auto_select": {
+        "type": "switch",
+        "name": "自动选择模型",
+        "default": true
+      },
+      "default_model": {
+        "type": "string",
+        "name": "默认模型组",
+        "options": [
+          "auto",
+          "1",
+          "2",
+          "3",
+          "4"
+        ],
+        "default": "auto"
+      },
+      "allowed_adapters": {
+        "type": "list",
+        "name": "适配器白名单",
+        "default": [
+          "qq"
+        ]
+      },
+      "max_session_per_user": {
+        "type": "integer",
+        "name": "每会话最大视频数",
+        "default": 5,
+        "minimum": 1,
+        "maximum": 20
+      }
+    }
+  },
+  "section_cache": {
+    "type": "section",
+    "name": "💾 缓存设置",
+    "collapsed": false,
+    "fields": {
+      "bili_cache_dir": {
+        "type": "string",
+        "name": "B站缓存目录",
+        "default": "files/video_cache",
+        "hint": "B站下载和发送的视频放这里"
+      },
+      "bili_max_cache_files": {
+        "type": "integer",
+        "name": "B站缓存上限",
+        "default": 100,
+        "minimum": 10,
+        "maximum": 500
+      },
+      "bili_cleanup_count": {
+        "type": "integer",
+        "name": "B站每次清理数",
+        "default": 20,
+        "minimum": 5,
+        "maximum": 100
+      },
+      "other_cache_dir": {
+        "type": "string",
+        "name": "其他视频缓存目录",
+        "default": "files/video_analysis_cache",
+        "hint": "QQ收到的视频/本地视频/分析产生的帧和压缩文件放这里"
+      },
+      "other_max_cache_files": {
+        "type": "integer",
+        "name": "其他缓存上限",
+        "default": 200,
+        "minimum": 10,
+        "maximum": 1000
+      },
+      "other_cleanup_count": {
+        "type": "integer",
+        "name": "其他每次清理数",
+        "default": 30,
+        "minimum": 5,
+        "maximum": 200
+      }
+    }
+  },
+  "section_model_1": {
+    "type": "section",
+    "name": "📦 模型组 1（GLM-5.3-Flash 推荐）",
+    "collapsed": false,
+    "fields": {
+      "enabled_1": {
+        "type": "switch",
+        "name": "启用",
+        "default": true
+      },
+      "model_name_1": {
+        "type": "string",
+        "name": "模型名称",
+        "default": "glm-5.3-flash"
+      },
+      "mode_1": {
+        "type": "string",
+        "name": "模式",
+        "options": [
+          "native",
+          "frames"
+        ],
+        "default": "native",
+        "hint": "native=传视频URL给模型；frames=本地抽帧拼图后传图片"
+      },
+      "api_base_1": {
+        "type": "string",
+        "name": "API 地址",
+        "default": "https://open.bigmodel.cn/api/paas/v4"
+      },
+      "api_key_1": {
+        "type": "sensitive",
+        "name": "API Key",
+        "default": ""
+      },
+      "priority_1": {
+        "type": "integer",
+        "name": "优先级",
+        "default": 1,
+        "minimum": 1,
+        "maximum": 10
+      },
+      "max_video_sec_1": {
+        "type": "integer",
+        "name": "最大视频时长(秒)",
+        "default": 600,
+        "minimum": 10
+      },
+      "extra_headers_1": {
+        "type": "json",
+        "name": "额外请求头",
+        "default": {},
+        "hint": "JSON 对象，会合并进每次 API 请求头（OpenAI SDK 的 extra_headers）。例如 {\"X-Api-Version\":\"2024-01\"}"
+      },
+      "extra_body_1": {
+        "type": "json",
+        "name": "额外请求体",
+        "default": {},
+        "hint": "JSON 对象，会合并进请求体（OpenAI SDK 的 extra_body），用于厂商私有参数。例如 {\"enable_thinking\":true,\"thinking_budget\":4096} 或 {\"thinking\":{\"type\":\"enabled\"}}"
+      }
+    }
+  },
+  "section_model_2": {
+    "type": "section",
+    "name": "📦 模型组 2（Qwen3-VL 推荐）",
+    "collapsed": false,
+    "fields": {
+      "enabled_2": {
+        "type": "switch",
+        "name": "启用",
+        "default": false
+      },
+      "model_name_2": {
+        "type": "string",
+        "name": "模型名称",
+        "default": "qwen3.8-max"
+      },
+      "mode_2": {
+        "type": "string",
+        "name": "模式",
+        "options": [
+          "native",
+          "frames"
+        ],
+        "default": "native"
+      },
+      "api_base_2": {
+        "type": "string",
+        "name": "API 地址",
+        "default": "https://dashscope.aliyuncs.com/compatible-mode/v1"
+      },
+      "api_key_2": {
+        "type": "sensitive",
+        "name": "API Key",
+        "default": ""
+      },
+      "priority_2": {
+        "type": "integer",
+        "name": "优先级",
+        "default": 2
+      },
+      "max_video_sec_2": {
+        "type": "integer",
+        "name": "最大视频时长(秒)",
+        "default": 1800
+      },
+      "extra_headers_2": {
+        "type": "json",
+        "name": "额外请求头",
+        "default": {},
+        "hint": "JSON 对象，会合并进每次 API 请求头（OpenAI SDK 的 extra_headers）。例如 {\"X-Api-Version\":\"2024-01\"}"
+      },
+      "extra_body_2": {
+        "type": "json",
+        "name": "额外请求体",
+        "default": {},
+        "hint": "JSON 对象，会合并进请求体（OpenAI SDK 的 extra_body），用于厂商私有参数。例如 {\"enable_thinking\":true,\"thinking_budget\":4096} 或 {\"thinking\":{\"type\":\"enabled\"}}"
+      }
+    }
+  },
+  "section_model_3": {
+    "type": "section",
+    "name": "📦 模型组 3（Gemini 2.5 推荐）",
+    "collapsed": true,
+    "fields": {
+      "enabled_3": {
+        "type": "switch",
+        "name": "启用",
+        "default": false
+      },
+      "model_name_3": {
+        "type": "string",
+        "name": "模型名称",
+        "default": "gemini-2.5-pro"
+      },
+      "mode_3": {
+        "type": "string",
+        "name": "模式",
+        "options": [
+          "native",
+          "frames"
+        ],
+        "default": "native"
+      },
+      "api_base_3": {
+        "type": "string",
+        "name": "API 地址",
+        "default": "https://generativelanguage.googleapis.com/v1beta/openai"
+      },
+      "api_key_3": {
+        "type": "sensitive",
+        "name": "API Key",
+        "default": ""
+      },
+      "priority_3": {
+        "type": "integer",
+        "name": "优先级",
+        "default": 3
+      },
+      "max_video_sec_3": {
+        "type": "integer",
+        "name": "最大视频时长(秒)",
+        "default": 2700
+      },
+      "extra_headers_3": {
+        "type": "json",
+        "name": "额外请求头",
+        "default": {},
+        "hint": "JSON 对象，会合并进每次 API 请求头（OpenAI SDK 的 extra_headers）。例如 {\"X-Api-Version\":\"2024-01\"}"
+      },
+      "extra_body_3": {
+        "type": "json",
+        "name": "额外请求体",
+        "default": {},
+        "hint": "JSON 对象，会合并进请求体（OpenAI SDK 的 extra_body），用于厂商私有参数。例如 {\"enable_thinking\":true,\"thinking_budget\":4096} 或 {\"thinking\":{\"type\":\"enabled\"}}"
+      }
+    }
+  },
+  "section_model_4": {
+    "type": "section",
+    "name": "📦 模型组 4（备用）",
+    "collapsed": true,
+    "fields": {
+      "enabled_4": {
+        "type": "switch",
+        "name": "启用",
+        "default": false
+      },
+      "model_name_4": {
+        "type": "string",
+        "name": "模型名称",
+        "default": "agnes-2.5-flash"
+      },
+      "mode_4": {
+        "type": "string",
+        "name": "模式",
+        "options": [
+          "frames",
+          "native"
+        ],
+        "default": "frames"
+      },
+      "api_base_4": {
+        "type": "string",
+        "name": "API 地址",
+        "default": ""
+      },
+      "api_key_4": {
+        "type": "sensitive",
+        "name": "API Key",
+        "default": ""
+      },
+      "priority_4": {
+        "type": "integer",
+        "name": "优先级",
+        "default": 9
+      },
+      "max_video_sec_4": {
+        "type": "integer",
+        "name": "最大视频时长(秒)",
+        "default": 120
+      },
+      "extra_headers_4": {
+        "type": "json",
+        "name": "额外请求头",
+        "default": {},
+        "hint": "JSON 对象，会合并进每次 API 请求头（OpenAI SDK 的 extra_headers）。例如 {\"X-Api-Version\":\"2024-01\"}"
+      },
+      "extra_body_4": {
+        "type": "json",
+        "name": "额外请求体",
+        "default": {},
+        "hint": "JSON 对象，会合并进请求体（OpenAI SDK 的 extra_body），用于厂商私有参数。例如 {\"enable_thinking\":true,\"thinking_budget\":4096} 或 {\"thinking\":{\"type\":\"enabled\"}}"
+      }
+    }
+  },
+  "section_frame": {
+    "type": "section",
+    "name": "🖼 抽帧与拼图",
+    "collapsed": false,
+    "fields": {
+      "target_frames": {
+        "type": "integer",
+        "name": "目标帧数",
+        "default": 40,
+        "minimum": 10,
+        "maximum": 120
+      },
+      "max_frames_per_grid": {
+        "type": "integer",
+        "name": "每张拼图最多帧数",
+        "default": 20,
+        "minimum": 6,
+        "maximum": 30
+      },
+      "grid_cols": {
+        "type": "integer",
+        "name": "拼图列数",
+        "default": 5,
+        "minimum": 2,
+        "maximum": 8
+      },
+      "scene_threshold": {
+        "type": "float",
+        "name": "场景变化敏感度",
+        "default": 0.3,
+        "minimum": 0.1,
+        "maximum": 0.8
+      },
+      "frame_width": {
+        "type": "integer",
+        "name": "单帧宽度(px)",
+        "default": 320,
+        "minimum": 160,
+        "maximum": 640
+      },
+      "frame_ratio": {
+        "type": "string",
+        "name": "帧比例",
+        "options": [
+          "16:9",
+          "4:3",
+          "1:1",
+          "auto"
+        ],
+        "default": "16:9"
+      }
+    }
+  },
+  "section_limits": {
+    "type": "section",
+    "name": "🔒 安全限制",
+    "collapsed": false,
+    "fields": {
+      "max_file_size_mb": {
+        "type": "integer",
+        "name": "最大文件大小(MB)",
+        "default": 200,
+        "minimum": 10,
+        "maximum": 2000
+      },
+      "max_duration_sec": {
+        "type": "integer",
+        "name": "最大视频时长(秒)",
+        "default": 600,
+        "minimum": 10,
+        "maximum": 7200
+      },
+      "download_timeout_sec": {
+        "type": "integer",
+        "name": "下载超时(秒)",
+        "default": 120,
+        "minimum": 10,
+        "maximum": 600
+      }
+    }
+  },
+  "section_bili": {
+    "type": "section",
+    "name": "📺 B站配置",
+    "collapsed": false,
+    "fields": {
+      "bili_enabled": {
+        "type": "switch",
+        "name": "启用B站功能",
+        "default": true
+      },
+      "bili_cookie": {
+        "type": "sensitive",
+        "name": "B站 Cookie",
+        "default": ""
+      },
+      "bili_use_ai_summary": {
+        "type": "switch",
+        "name": "优先B站AI总结",
+        "default": true
+      },
+      "auto_send_link": {
+        "type": "switch",
+        "name": "自动发送B站链接（钩子）",
+        "default": false,
+        "hint": "开启后检测到消息中的B站链接/BV号，自动下载压缩视频并发送到群/私聊，不消耗token"
+      },
+      "bili_download_quality": {
+        "type": "string",
+        "name": "B站下载质量",
+        "options": [
+          "low",
+          "medium",
+          "original"
+        ],
+        "default": "low",
+        "hint": "low=360p，medium=720p，original=原画。下载时直接选对应档位，不下原画再压"
+      },
+      "bili_compress_quality": {
+        "type": "string",
+        "name": "B站压缩质量(下载后再压)",
+        "options": [
+          "original",
+          "low",
+          "medium"
+        ],
+        "default": "original",
+        "hint": "original=不压缩直接用下载的文件；low=再压到360p；medium=再压到720p。仅在下载质量不如意时需要"
+      },
+      "auto_send_allowed_sid": {
+        "type": "list",
+        "name": "自动发送白名单(sid)",
+        "default": [],
+        "hint": "留空=全部启用；填 sid 如 qq:gm:123456 则仅这些会话生效"
+      },
+      "search_show_desc": {
+        "type": "switch",
+        "name": "搜索显示简介",
+        "default": true
+      },
+      "search_desc_max_chars": {
+        "type": "integer",
+        "name": "简介截断字数",
+        "default": 100,
+        "minimum": 20,
+        "maximum": 300
+      },
+      "bili_search_count": {
+        "type": "integer",
+        "name": "搜索结果数",
+        "default": 5,
+        "minimum": 1,
+        "maximum": 20
+      },
+      "bili_max_download_sec": {
+        "type": "integer",
+        "name": "下载最大时长(秒)",
+        "default": 600,
+        "minimum": 10,
+        "maximum": 7200
+      }
+    }
+  },
+  "section_upload": {
+    "type": "section",
+    "name": "☁️ 视频上传（原生模式用）",
+    "collapsed": false,
+    "fields": {
+      "upload_enabled": {
+        "type": "switch",
+        "name": "上传换取公开链接",
+        "default": false,
+        "hint": "⚠️ 默认关闭。开启后 native 模式（如智谱 GLM 只接受公网 URL）会先把视频上传到文件中转服务——该视频将可通过链接被任何人访问，请注意隐私。frames 帧模式不受影响"
+      },
+      "upload_hosts": {
+        "type": "list",
+        "name": "上传服务（按顺序尝试）",
+        "default": [
+          "https://litterbox.catbox.moe",
+          "https://x0.at"
+        ],
+        "hint": "一个标签一个地址；前一个失败自动换下一个。litterbox=临时(1h~72h,上限1GB)；x0.at=临时(3~100天,上限1GB)。也支持 0x0.st / 自建 filehost2 / catbox（需账号，匿名常被拒）"
+      },
+      "upload_max_mb": {
+        "type": "integer",
+        "name": "上传大小上限(MB)",
+        "default": 200,
+        "hint": "超过此大小不尝试上传（x0.at 单文件上限 1024MB）"
+      },
+      "upload_compress_over_mb": {
+        "type": "integer",
+        "name": "超过此大小先压缩(MB)",
+        "default": 20,
+        "hint": "≤该值直接上传（保住画质、少一次转码）；超过则先压到 720p 再传。设 0 = 永不压缩"
+      },
+      "upload_timeout_sec": {
+        "type": "integer",
+        "name": "上传超时(秒)",
+        "default": 300
+      },
+      "upload_keep_name": {
+        "type": "switch",
+        "name": "链接保留原文件名",
+        "default": true
+      },
+      "upload_use_proxy": {
+        "type": "switch",
+        "name": "上传走环境代理",
+        "default": false,
+        "hint": "默认直连；上传失败会自动再试一次走环境变量里的 HTTP 代理"
+      }
+    }
+  },
+  "section_session": {
+    "type": "section",
+    "name": "💬 会话管理",
+    "collapsed": true,
+    "fields": {
+      "session_ttl_minutes": {
+        "type": "integer",
+        "name": "视频会话超时(分)",
+        "default": 30,
+        "minimum": 1,
+        "maximum": 1440
+      },
+      "send_video_quality": {
+        "type": "string",
+        "name": "发送视频质量",
+        "options": [
+          "low",
+          "medium",
+          "original"
+        ],
+        "default": "low"
+      },
+      "default_prompt": {
+        "type": "markdown",
+        "name": "默认分析提示词",
+        "default": "你刚刚收到一个视频。请分析其内容，包括：\n1. 视频整体描述\n2. 关键事件时间线\n3. 值得注意的细节\n4. 语音/对话内容"
+      }
+    }
+  }
+}
