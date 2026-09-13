@@ -195,6 +195,7 @@ analyze_video(session_id="abc123", segments=[[10,30],[100,130]])   # 一次多�
 
 ## 版本
 
+- 1.11.1 — **修复装饰器错位**（严重）：`@on.im_message` 被误挂到 `_is_video_ele` 上，导致每收到一条消息就抛 `TypeError: object bool can't be used in 'await' expression`，同时 `_detect` 丢失注册、**视频检测整体失效**。已加防回归断言（hook 名单必须精确匹配 + 每个 hook 必须是 async 函数）
 - 1.11.0 — 补齐「主动拉取」：递归支持合并转发的 `Forward.chains`（此前只认 `Reply.chain` 单数形式，转发里的视频全漏）；新增按「被引用消息 ID」调 `get_msg` 主动拉取；且只在有视频迹象时才调接口，纯文字消息不再白跑 API。缓存单文件上限默认 50MB → **20MB**
 - 1.10.0 — 缓存补三道闸：`cache_max_file_mb`(单个 50MB，边下边检测、超限中止)、`cache_ttl_hours`(24h 超龄清理)、`cache_max_total_mb`(目录 2GB 总量上限)；清理维度从「只按条数」升级为「TTL → 总容量 → 条数」；分析下载也加同样的流式限制
 - 1.9.0 — 新增视频自动缓存（`auto_cache_video`）：递归接住**引用/转发消息里的视频**并立刻下载到本地，下一轮对话把路径告诉 bot；`_pending` 增加 10 分钟时效避免反复提示。绕开框架「体积未知 → 误报超过 10MB → 不缓存」的问题
