@@ -153,10 +153,18 @@ def parse_transcript(payload) -> dict:
 
 async def transcribe(audio_path: str, base_url: str, api_key: str, model: str, *,
                      timeout: float = 300.0, language: str = "",
-                     prompt_text: str = "", use_proxy: bool = False) -> dict:
+                     prompt_text: str = "", use_proxy: bool = False,
+                     extra_headers: dict | None = None,
+                     extra_body: dict | None = None) -> dict:
     """调用 OpenAI 兼容的 /audio/transcriptions。
 
     先尝试拿原生时间戳（verbose_json），失败再退回纯文本。
+
+    :param extra_headers: 额外请求头（JSON 对象），合并进 HTTP 头
+    :param extra_body: 额外**表单字段**（JSON 对象）。ASR 走的是 multipart/form-data，
+                       所以这里是"再往表单里塞几个字段"，如 {"temperature": 0}，
+                       不是 JSON body 合并。插件自己设置的字段（file/model/
+                       response_format 等）不会被覆盖。
     """
     p = Path(audio_path)
     if not p.is_file() or p.stat().st_size == 0:
@@ -171,10 +179,17 @@ async def transcribe(audio_path: str, base_url: str, api_key: str, model: str, *
     mime = AUDIO_MIME.get(p.suffix.lower(), "application/octet-stream")
     tmo = httpx.Timeout(connect=20.0, read=timeout, write=timeout, pool=20.0)
 
+    headers = {"User-Agent": UA}
+    for k, v in (extra_headers or {}).items():
+        try:
+            headers[str(k)] = str(v)
+        except Exception:
+            continue
+
     def _post(form: dict, use_env_proxy: bool):
         with open(p, "rb") as fh:
             files = {"file": (p.name, fh, mime)}
-            with httpx.Client(headers={"User-Agent": UA}, timeout=tmo,
+            with httpx.Client(headers=headers, timeout=tmo,
                               follow_redirects=True, trust_env=use_env_proxy) as c:
                 return c.post(url, data=form, files=files)
 
@@ -183,6 +198,20 @@ async def transcribe(audio_path: str, base_url: str, api_key: str, model: str, *
         base_form["language"] = language
     if prompt_text:
         base_form["prompt"] = prompt_text
+    # 额外表单字段（用户自定义；不覆盖上面的关键字段）
+    for k, v in (extra_body or {}).items():
+        k = str(k)
+        if not k or k in base_form or k == "file":
+            continue
+        if isinstance(v, (list, tuple)):
+            base_form[k] = [x if isinstance(x, str) else json.dumps(x, ensure_ascii=False)
+                            for x in v]
+        elif isinstance(v, (dict, bool)):
+            base_form[k] = json.dumps(v, ensure_ascii=False)
+        elif isinstance(v, (int, float)):
+            base_form[k] = str(v)
+        else:
+            base_form[k] = str(v)
 
     attempts = [
         {**base_form, "response_format": "verbose_json",
