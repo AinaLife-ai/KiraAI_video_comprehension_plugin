@@ -463,6 +463,150 @@ async def clip_video(src: str, dst: str, start: float, end: float) -> tuple:
     return await loop.run_in_executor(None, _run)
 
 
+# ── 音频处理（语音转写用） ─────────────────────────────────
+
+async def extract_audio(video_path: str, out_path: str, sample_rate: int = 16000,
+                        timeout: int = 180) -> str:
+    """从视频抽出单声道音频（16k PCM wav，ASR 通用格式）。
+
+    只解码不重编码视频，10 分钟视频通常 1~2 秒。
+    """
+    cmd = [
+        "ffmpeg", "-y", "-i", video_path,
+        "-vn",                      # 丢视频流
+        "-ac", "1",                 # 单声道
+        "-ar", str(sample_rate),    # 采样率
+        "-c:a", "pcm_s16le",
+        out_path,
+    ]
+
+    def _run():
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if r.returncode != 0 or not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+            raise RuntimeError(f"抽音轨失败: {(r.stderr or '')[:300]}")
+        return out_path
+
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _run)
+
+
+async def detect_speech_ranges(audio_path: str, noise_db: float = -35.0,
+                               min_silence: float = 0.4,
+                               timeout: int = 180) -> tuple:
+    """用 ffmpeg silencedetect 分析音轨，返回 (有声段列表, 总时长)。
+
+    有声段 = 非静音区间，元素为 (start, end)，单位秒。
+    这是 L2「非语音声音」标注的基础：有声段里 ASR 什么都没识别出来的部分，
+    就是"有声音但没人说话"（音乐/音效/环境音）。
+    """
+    cmd = [
+        "ffmpeg", "-i", audio_path,
+        "-af", f"silencedetect=noise={noise_db}dB:d={min_silence}",
+        "-f", "null", "-",
+    ]
+
+    def _run():
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.stderr or ""
+
+    loop = asyncio.get_event_loop()
+    err = await loop.run_in_executor(None, _run)
+
+    silences = []
+    cur_start = None
+    total = 0.0
+    for line in err.splitlines():
+        m = re.search(r"silence_start:\s*([\d.]+)", line)
+        if m:
+            cur_start = float(m.group(1)); continue
+        m = re.search(r"silence_end:\s*([\d.]+)", line)
+        if m:
+            end = float(m.group(1))
+            if cur_start is not None:
+                silences.append((cur_start, end))
+            cur_start = None; continue
+        m = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", line)
+        if m:
+            total = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+
+    # 静音段的补集 = 有声段
+    speech = []
+    cursor = 0.0
+    for s, e in silences:
+        if s > cursor + 0.01:
+            speech.append((cursor, s))
+        cursor = max(cursor, e)
+    end_of_audio = total if total > 0 else (silences[-1][1] if silences else 0.0)
+    if end_of_audio > cursor + 0.01:
+        speech.append((cursor, end_of_audio))
+    return speech, end_of_audio
+
+
+def merge_ranges(ranges, gap: float = 0.6, max_len: float = 30.0, max_count: int = 80):
+    """合并/切分有声段为 ASR 友好的块。
+
+    - 相邻间隔 < gap 的段合并
+    - 单块超过 max_len 的再切开
+    - 若算出来的块数超过 max_count，**成倍放大块长重切**（保住全部内容，
+      只牺牲时间精度），而不是丢尾——长视频不会因此丢掉后半段。
+    """
+    if not ranges:
+        return []
+
+    def _build(ml: float, gp: float):
+        merged = []
+        cur_s, cur_e = ranges[0]
+        for s, e in ranges[1:]:
+            if s - cur_e <= gp and (e - cur_s) <= ml:
+                cur_e = e
+            else:
+                merged.append((cur_s, cur_e))
+                cur_s, cur_e = s, e
+        merged.append((cur_s, cur_e))
+
+        out = []
+        for s, e in merged:
+            while e - s > ml:
+                out.append((s, s + ml))
+                s += ml
+            if e - s > 0.05:
+                out.append((s, e))
+        return out
+
+    out = _build(max_len, gap)
+    rounds = 0
+    while len(out) > max_count and rounds < 8:
+        # 块数由「间隔阈值」决定，块长只是上限 —— 两个都要放宽才压得下来
+        max_len *= 2
+        gap *= 2
+        out = _build(max_len, gap)
+        rounds += 1
+    return out[:max_count] if len(out) > max_count else out
+
+
+async def slice_audio(audio_path: str, out_path: str, start: float, end: float,
+                      timeout: int = 60) -> str:
+    """按时间区间切出一小段音频（给 ASR 逐块识别用）"""
+    dur = max(0.05, float(end) - float(start))
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", f"{max(0.0, float(start)):.3f}",
+        "-i", audio_path,
+        "-t", f"{dur:.3f}",
+        "-c", "copy",
+        out_path,
+    ]
+
+    def _run():
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if r.returncode != 0 or not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+            raise RuntimeError(f"音频切块失败: {(r.stderr or '')[:200]}")
+        return out_path
+
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _run)
+
+
 # ── 时间戳标注 ─────────────────────────────────────────────
 
 def stamp_frame(frame_img: Image.Image, timestamp: float,

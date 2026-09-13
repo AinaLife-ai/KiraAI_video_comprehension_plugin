@@ -38,11 +38,15 @@ from core.chat.message_elements import Text
 from core.provider import LLMRequest
 from core.utils.path_utils import get_data_path
 
-from video_processor import process_video, compress_video, clip_video, download_video
+from video_processor import (process_video, compress_video, clip_video, download_video,
+                             extract_audio, detect_speech_ranges, merge_ranges, slice_audio)
+from asr import (transcribe as asr_transcribe, build_timeline_doc, ASRError,
+                  normalize_segments_by_duration)
 from video_host import upload_to_any, UploadError, DEFAULT_HOSTS as DEFAULT_UPLOAD_HOSTS
 from llm_proxy import (ModelProfile, select_model, build_meta, analyze_frames,
                        analyze_native, NATIVE_MAX_MB)
-from bili_dl import search_bili, get_bili_info, get_ai_summary, download_bili_video, extract_bvid, BiliError
+from bili_dl import (search_bili, get_bili_info, get_ai_summary, download_bili_video,
+                     extract_bvid, BiliError, get_bilibili_subtitle)
 
 BILI_RE = re.compile(r"(BV[0-9A-Za-z]{10}|b23\.tv/[^\s]+|bilibili\.com/(?:video/|BV))", re.I)
 BVID_RE = re.compile(r"BV[0-9A-Za-z]{10}")
@@ -60,7 +64,7 @@ class VideoSession:
         "file_size_mb", "compressed_size_mb",
         "analysis", "analysis_model", "analysis_mode",
         "history", "last_interact", "bili_ai_summary",
-        "host_url",
+        "host_url", "transcript_doc",
     )
     def __init__(self, session_id, sid, source, source_url):
         self.session_id = session_id
@@ -83,6 +87,7 @@ class VideoSession:
         self.last_interact = time.time()
         self.bili_ai_summary = None
         self.host_url = ""          # 上传到文件中转后的公开直链（若有）
+        self.transcript_doc = ""    # 语音转写时间轴文档（若有）
 
     def is_stale(self, ttl: int) -> bool:
         return time.time() - self.last_interact > ttl * 60
@@ -107,6 +112,7 @@ class VideoComprehensionPlugin(BasePlugin):
         self._stream_unsupported = False
         self._upload_cache: dict[str, str] = {}   # 本地路径 → 已上传的公开 URL
         self._cached_videos: dict[str, dict] = {}  # sid → 已缓存到本地、待告知 bot 的视频
+        self._asr_tasks: dict[str, asyncio.Task] = {}   # 转写缓存 key → 进行中的任务
         self._load_cfg(cfg)
 
     def _load_cfg(self, cfg: dict):
@@ -187,6 +193,24 @@ class VideoComprehensionPlugin(BasePlugin):
         self.upload_hosts = [str(h).strip() for h in (hosts or []) if str(h).strip()] \
             or list(DEFAULT_UPLOAD_HOSTS)
         self.upload_host = self.upload_hosts[0]   # 兼容旧引用
+
+        # ── 语音转写（给模型补上"声音"信息） ──
+        au = cfg.get("section_audio", {}) or {}
+        self.audio_enabled = bool(au.get("audio_transcribe_enabled", True))
+        self.audio_base_url = str(au.get("audio_stt_base_url", "") or "").strip()
+        self.audio_api_key = str(au.get("audio_stt_api_key", "") or "").strip()
+        self.audio_model = str(au.get("audio_stt_model", "") or "").strip()
+        self.audio_wait_sec = float(au.get("audio_wait_sec", 30) or 30)
+        self.audio_max_sec = float(au.get("audio_max_sec", 0) or 0)
+        self.audio_language = str(au.get("audio_language", "") or "").strip()
+        self.audio_timeout = float(au.get("audio_timeout_sec", 300) or 300)
+        self.audio_use_proxy = bool(au.get("audio_use_proxy", False))
+        self.audio_block_sec = float(au.get("audio_block_sec", 30) or 30)
+        self.audio_gap_sec = float(au.get("audio_gap_sec", 2.5) or 2.5)
+        self.bili_use_subtitle = bool(au.get("bili_use_subtitle", True))
+        self.audio_max_blocks = int(au.get("audio_max_blocks", 80) or 80)
+        self.audio_concurrency = max(1, min(16, int(au.get("audio_concurrency", 5) or 5)))
+        self.audio_silence_db = float(au.get("audio_silence_db", -35) or -35)
         self.upload_max_mb = int(us.get("upload_max_mb", 200))
         self.upload_compress_over_mb = int(us.get("upload_compress_over_mb", 20))
         self.upload_timeout = int(us.get("upload_timeout_sec", 300))
@@ -331,6 +355,10 @@ class VideoComprehensionPlugin(BasePlugin):
             except asyncio.CancelledError: pass
         self._pending.clear(); self._sessions.clear(); self._sid_sessions.clear()
         self._cached_videos.clear()
+        for t in list(self._asr_tasks.values()):
+            if not t.done():
+                t.cancel()
+        self._asr_tasks.clear()
 
     # ── 缓存清理（通用） ──
 
@@ -699,6 +727,206 @@ class VideoComprehensionPlugin(BasePlugin):
             logger.warning("[VC] 视频缓存失败: %s", e)
         return ""
 
+    async def _cache_then_transcribe(self, sid: str, url: str, name: str = ""):
+        """缓存视频后立刻并行启动语音转写（这样 bot 真要分析时通常已算好）"""
+        path = await self._cache_incoming_video(sid, url, name)
+        if path:
+            self._start_transcript_task(path)
+
+    # ── 语音转写（把"声音"变成模型读得到的文字） ──
+
+    def _asr_ready(self) -> bool:
+        return bool(self.audio_enabled and self.audio_base_url and self.audio_model)
+
+    def _transcript_key(self, video_path: str) -> str:
+        try:
+            st = os.stat(video_path)
+            raw = f"{os.path.abspath(video_path)}:{st.st_size}:{int(st.st_mtime)}"
+        except Exception:
+            raw = str(video_path)
+        return hashlib.md5(raw.encode()).hexdigest()[:16]
+
+    def _transcript_path(self, key: str) -> str:
+        d = os.path.join(self.other_cache_dir, ".transcripts")
+        os.makedirs(d, exist_ok=True)
+        return os.path.join(d, f"{key}.json")
+
+    def _load_transcript(self, key: str):
+        try:
+            p = self._transcript_path(key)
+            if os.path.isfile(p):
+                with open(p, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return None
+
+    def _save_transcript(self, key: str, data: dict):
+        try:
+            with open(self._transcript_path(key), "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+        except Exception as e:
+            logger.debug("[VC] 转写缓存写入失败: %s", e)
+
+    async def _segment_transcribe(self, wav: str, speech_ranges, work: str):
+        """兜底：ASR 不返回时间戳时，用本地 VAD 切块逐块识别来造时间轴。
+
+        只在「服务只给纯文本」时才会走到这里（例如硅基流动 SenseVoice）。
+        """
+        blocks = merge_ranges(speech_ranges, gap=self.audio_gap_sec,
+                              max_len=self.audio_block_sec,
+                              max_count=self.audio_max_blocks)
+        if not blocks:
+            return []
+        sem = asyncio.Semaphore(self.audio_concurrency)
+
+        async def _one(i: int, s: float, e: float):
+            async with sem:
+                try:
+                    seg_path = os.path.join(work, f"blk_{i:03d}.wav")
+                    await slice_audio(wav, seg_path, s, e)
+                    r = await asr_transcribe(seg_path, self.audio_base_url,
+                                             self.audio_api_key, self.audio_model,
+                                             timeout=self.audio_timeout,
+                                             language=self.audio_language,
+                                             use_proxy=self.audio_use_proxy)
+                    txt = (r.get("text") or "").strip()
+                    return {"start": s, "end": e, "text": txt} if txt else None
+                except Exception as ex:
+                    logger.debug("[VC] 切块转写失败 [%.1f-%.1f]: %s", s, e, ex)
+                    return None
+
+        results = await asyncio.gather(*(_one(i, s, e) for i, (s, e) in enumerate(blocks)))
+        logger.info("[VC] 切块转写：%d 块 → %d 段有文字（ASR 无原生时间戳）",
+                    len(blocks), sum(1 for x in results if x))
+        return [x for x in results if x]
+
+    async def _build_transcript(self, video_path: str, bvid: str = "", cid: int = 0) -> dict:
+        """完整转写流程。
+
+        ① B 站视频优先用**官方字幕**（精确时间轴、免费、不用抽音轨）
+        ② 没有字幕再走 ASR：抽音轨 → 静音分析 → 转写 → (必要时切块补轴)
+        """
+        want_sub = bool(self.bili_use_subtitle and bvid and cid)
+        if not self.audio_enabled or (not want_sub and not self._asr_ready()):
+            return {}
+        key = self._transcript_key(video_path)
+        cached = self._load_transcript(key)
+        if cached:
+            return cached
+        t0 = time.time()
+
+        # ① B 站官方字幕优先
+        if want_sub:
+            try:
+                segs, lan_doc, n_tracks = await get_bilibili_subtitle(
+                    bvid, cid, self.bili_cookie, prefer_lan=self.audio_language,
+                    timeout=self.dl_timeout)
+                if segs:
+                    doc = build_timeline_doc(
+                        segs, [], 0,
+                        header=(f"【视频字幕（B站 {lan_doc or 'CC'}，共{n_tracks}条轨）"
+                                f"· 时间轴与画面帧口径一致】"))
+                    data = {"doc": doc, "segments": segs, "speech": [],
+                            "total": round(float(segs[-1].get("end") or 0), 3),
+                            "native_axis": True, "asr_source": "bilibili_subtitle",
+                            "elapsed": round(time.time() - t0, 2)}
+                    self._save_transcript(key, data)
+                    logger.info("[VC] 用上 B 站官方字幕：%d 条（%s，用时 %.1fs）",
+                                len(segs), lan_doc or "?", time.time() - t0)
+                    return data
+                logger.info("[VC] 该 B 站视频无可用字幕，转音频识别")
+            except Exception as e:
+                logger.info("[VC] B 站字幕获取失败，转音频识别: %s", e)
+        if not self._asr_ready():
+            return {}
+        work = os.path.join(self.other_cache_dir, f".asr_{key}")
+        os.makedirs(work, exist_ok=True)
+        try:
+            wav = os.path.join(work, "audio.wav")
+            await extract_audio(video_path, wav)
+            speech, total = await detect_speech_ranges(wav, noise_db=self.audio_silence_db)
+            if self.audio_max_sec > 0 and total > self.audio_max_sec:
+                logger.info("[VC] 音频 %.0fs 超过转写上限 %.0fs，跳过", total, self.audio_max_sec)
+                return {}
+            result = await asr_transcribe(wav, self.audio_base_url, self.audio_api_key,
+                                          self.audio_model, timeout=self.audio_timeout,
+                                          language=self.audio_language,
+                                          use_proxy=self.audio_use_proxy)
+            segs = result.get("segments") or []
+            native = bool(segs)
+            if segs:
+                # 兜底校正：有些服务给毫秒却用秒的字段名
+                segs = normalize_segments_by_duration(segs, total)
+            if not segs and (result.get("text") or "").strip() and speech:
+                segs = await self._segment_transcribe(wav, speech, work)
+            doc = build_timeline_doc(segs, speech, total)
+            data = {
+                "doc": doc, "segments": segs,
+                "speech": [[round(s, 3), round(e, 3)] for s, e in speech],
+                "total": round(total, 3),
+                "native_axis": native,
+                "asr_source": result.get("source", ""),
+                "elapsed": round(time.time() - t0, 2),
+            }
+            self._save_transcript(key, data)
+            logger.info("[VC] 语音转写完成：%.1fs，%d 段%s（用时 %.1fs）",
+                        total, len(segs), "，原生时间轴" if native else "，本地切块补轴",
+                        time.time() - t0)
+            return data
+        except ASRError as e:
+            logger.warning("[VC] 语音转写失败（不影响视频分析）: %s", e)
+        except Exception as e:
+            logger.warning("[VC] 语音转写异常（不影响视频分析）: %s", e)
+        return {}
+
+    def _start_transcript_task(self, video_path: str, bvid: str = "", cid: int = 0):
+        """后台启动转写（与视频缓存并行，拿到就缓存好，分析时零等待）"""
+        want_sub = bool(self.bili_use_subtitle and bvid and cid)
+        if not self.audio_enabled or (not want_sub and not self._asr_ready()):
+            return
+        if not video_path or not os.path.isfile(video_path):
+            return
+        key = self._transcript_key(video_path)
+        if key in self._asr_tasks and not self._asr_tasks[key].done():
+            return
+        if self._load_transcript(key):
+            return
+        task = asyncio.create_task(self._build_transcript(video_path, bvid=bvid, cid=cid))
+        self._asr_tasks[key] = task
+
+        def _cleanup(_t, k=key):
+            if self._asr_tasks.get(k) is _t:
+                self._asr_tasks.pop(k, None)
+        task.add_done_callback(_cleanup)
+
+    async def _get_transcript(self, video_path: str, wait: float,
+                              bvid: str = "", cid: int = 0) -> dict:
+        """取转写结果：缓存命中→秒用；有进行中任务→最多等 wait 秒；否则现场跑"""
+        want_sub = bool(self.bili_use_subtitle and bvid and cid)
+        if not self.audio_enabled or (not want_sub and not self._asr_ready()):
+            return {}
+        if not video_path or not os.path.isfile(video_path):
+            return {}
+        key = self._transcript_key(video_path)
+        cached = self._load_transcript(key)
+        if cached:
+            return cached
+        task = self._asr_tasks.get(key)
+        if task is None or task.done():
+            self._start_transcript_task(video_path, bvid=bvid, cid=cid)
+            task = self._asr_tasks.get(key)
+        if task is None:
+            return {}
+        try:
+            return await asyncio.wait_for(asyncio.shield(task), timeout=max(0.1, wait))
+        except asyncio.TimeoutError:
+            logger.info("[VC] 语音转写未在 %.0fs 内完成，本次分析先不带转写", wait)
+            return {}
+        except Exception as e:
+            logger.warning("[VC] 取转写失败: %s", e)
+            return {}
+
     @on.im_message(priority=Priority.HIGH)
     async def _detect(self, event: KiraMessageEvent, *_):
         if not self.enabled or not self._ok(event) or not self._is_qq(event):
@@ -787,7 +1015,7 @@ class VideoComprehensionPlugin(BasePlugin):
             # 立即缓存到本地（供 bot 直接使用）；http(s) 才下载，本地路径直接用
             if self.auto_cache_video:
                 if str(url).startswith(("http://", "https://")):
-                    asyncio.create_task(self._cache_incoming_video(sid, url, vname))
+                    asyncio.create_task(self._cache_then_transcribe(sid, url, vname))
                 elif os.path.isfile(url):
                     try:
                         rel = os.path.relpath(url, get_data_path()).replace("\\", "/")
@@ -1187,6 +1415,7 @@ class VideoComprehensionPlugin(BasePlugin):
         profile = select_model(self._profiles, duration_hint, self.default_model)
         if not profile: return "无合适模型"
 
+        info = {}          # B 站分支会填上 cid 等（供字幕获取用）
         if stype == "bilibili" and bvid:
             # B站: 源文件存在 bili_cache_dir
             os.makedirs(self.bili_cache_dir, exist_ok=True)
@@ -1233,11 +1462,20 @@ class VideoComprehensionPlugin(BasePlugin):
         self._register_session(sess, sid)
 
         real_segs = [(s, e) for s, e in (result.get("segments") or [])]
+        # 取转写/字幕（最多等 audio_wait_sec 秒；超时就不带，绝不卡住分析）
+        # B 站视频优先用官方字幕，其他视频走音频识别
+        tr = await self._get_transcript(raw_path, self.audio_wait_sec,
+                                       bvid=bvid if stype == "bilibili" else "",
+                                       cid=int((info or {}).get("cid") or 0)
+                                       if stype == "bilibili" else 0)
+        tdoc = tr.get("doc", "") or ""
         analysis, label, downgrade_note, host_url = await self._analyze_result(
-            profile, result, real_segs, question, work)
+            profile, result, real_segs, question, work, transcript_doc=tdoc)
         sess.analysis = analysis; sess.analysis_model = label; sess.analysis_mode = profile.mode
         if host_url:
             sess.host_url = host_url
+        if tdoc:
+            sess.transcript_doc = tdoc
 
         range_line = self._range_line(real_segs, result.get("duration", 0))
         link_line = self._link_line(host_url)
@@ -1257,6 +1495,23 @@ class VideoComprehensionPlugin(BasePlugin):
 
     # ── 时间段分析（复用已下载的视频） ──
 
+    def _clip_transcript(self, tr: dict, segs) -> str:
+        """只保留指定时间段的转写（时间段分析用，避免整片字幕干扰）"""
+        if not tr:
+            return ""
+        doc = tr.get("doc", "") or ""
+        if not doc or not segs:
+            return doc
+        s0 = min(float(s) for s, e in segs)
+        e0 = max(float(e) for s, e in segs)
+        subs = [g for g in (tr.get("segments") or [])
+                if float(g.get("end") or 0) > s0 and float(g.get("start") or 0) < e0]
+        speech = [r for r in (tr.get("speech") or [])
+                  if len(r) >= 2 and float(r[1]) > s0 and float(r[0]) < e0]
+        if not subs and not speech:
+            return ""
+        return build_timeline_doc(subs, speech, float(tr.get("total") or 0))
+
     def _range_line(self, segs, duration: float) -> str:
         """结果头部的分析范围标注"""
         if not segs or (len(segs) == 1 and segs[0][0] <= 0.05 and segs[0][1] >= duration - 0.5):
@@ -1266,16 +1521,22 @@ class VideoComprehensionPlugin(BasePlugin):
         return ("🔍 分析范围: " + str(len(segs)) + " 段 " +
                 " ".join(f"[{_ts(s)}-{_ts(e)}]" for s, e in segs) + "\n")
 
-    async def _analyze_result(self, profile, result, segs, question, work):
-        """按 模式 + 段数 选择分析路径，返回 (analysis, label, note)。
+    async def _analyze_result(self, profile, result, segs, question, work,
+                              transcript_doc: str = ""):
+        """按 模式 + 段数 选择分析路径，返回 (analysis, label, note, host_url)。
 
         - native + 单段 → 秒切该段片段（含音频）传给模型
         - 其他（frames / native 多段）→ 拼图帧模式
         - native 失败自动降级 frames
+        - transcript_doc：语音转写时间轴，两种模式都会带上
         """
         meta = build_meta(result["duration"], result["total_frames"],
                           result["grid_count"], result["scene_count"],
                           result.get("timestamps", []))
+        # 转写拼在提示词之后、问题之前：模型既看到画面，也知道"说了什么、什么时候说的"
+        ask_prompt = self.default_prompt
+        if transcript_doc:
+            ask_prompt = f"{self.default_prompt}\n\n{transcript_doc}"
         multi = len(segs) > 1
         src_for_native = result.get("compressed_path") or ""
         # 全片（未指定时间段）还是指定区间？全片直接用压缩后的整段视频，不做秒切
@@ -1348,7 +1609,7 @@ class VideoComprehensionPlugin(BasePlugin):
                     vpath = small
                 except Exception as e:
                     logger.warning("[VC] base64 回退压缩失败: %s", e)
-            ans = await analyze_native(profile, vpath, question, self.default_prompt,
+            ans = await analyze_native(profile, vpath, question, ask_prompt,
                                        video_url=url)
             tag = "native URL" if url else "native base64"
             if not is_full:
@@ -1366,7 +1627,7 @@ class VideoComprehensionPlugin(BasePlugin):
                     return f"⚠️ AI分析失败（{type(e).__name__}）", f"{profile.name} (native)", "", None
                 try:
                     analysis = await analyze_frames(profile, result["grids_base64"], meta,
-                                                    question, self.default_prompt)
+                                                    question, ask_prompt)
                     return (analysis, f"{profile.name} (native→frames)",
                             f"\n（原生视频模式失败，已降级为帧模式：{str(e)[:120]}）", None)
                 except Exception as e2:
@@ -1377,7 +1638,7 @@ class VideoComprehensionPlugin(BasePlugin):
         # frames 路径（含 native 多段：一次请求覆盖所有段）
         try:
             analysis = await analyze_frames(profile, result["grids_base64"], meta,
-                                            question, self.default_prompt)
+                                            question, ask_prompt)
             label = f"{profile.name} (frames" + (" 多段)" if multi else ")")
             note = "\n（多段分析走帧模式：一次请求覆盖所有段）" if (multi and profile.mode == "native") else ""
             return analysis, label, note, None
@@ -1417,7 +1678,11 @@ class VideoComprehensionPlugin(BasePlugin):
         if result["status"] != "ok":
             return f"⚠️ 处理失败：{result.get('error', result['status'])}"
 
-        analysis, label, note, host_url = await self._analyze_result(profile, result, real, question, work)
+        # 转写：优先用缓存/进行中的任务，超时就不带（不卡住）
+        tr = await self._get_transcript(path, self.audio_wait_sec)
+        analysis, label, note, host_url = await self._analyze_result(
+            profile, result, real, question, work,
+            transcript_doc=self._clip_transcript(tr, real))
         sess.add_turn(question or "(时间段分析)", analysis)
         if host_url:
             sess.host_url = host_url
@@ -1449,7 +1714,8 @@ class VideoComprehensionPlugin(BasePlugin):
                           sess.scene_count, sess.timestamps)
         ctx = f"之前: {sess.analysis[:500]}\n\n追问: {question}\n\n基于帧回答指出时间。"
         try:
-            ans = await analyze_frames(profile, sess.grids_base64, meta, ctx, "")
+            ans = await analyze_frames(profile, sess.grids_base64, meta, ctx,
+                                       sess.transcript_doc or "")
         except Exception as e: ans = f"⚠️ 追问失败: {type(e).__name__}: {e}"
         sess.add_turn(question, ans)
         return (f"🤖 {profile.name} | session={sess.session_id}\n"
