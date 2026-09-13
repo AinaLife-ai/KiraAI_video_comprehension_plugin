@@ -1,7 +1,7 @@
 {
   "display_name": "Video Comprehension 视频理解",
   "plugin_id": "video-comprehension",
-  "version": "1.7.0",
+  "version": "1.11.0",
   "author": "KiraAI",
   "description": "视频理解插件：自动检测QQ/B站视频消息，压缩+抽帧+拼图分析，支持多模型（原生/帧模式），内建B站AI总结优先，支持本地视频/B站搜索下载分析。",
   "repo": "https://github.com/znq19/KiraAI_video_comprehension_plugin",
