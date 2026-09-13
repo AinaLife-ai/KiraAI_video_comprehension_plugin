@@ -570,6 +570,99 @@
       }
     }
   },
+  "section_audio": {
+    "type": "section",
+    "name": "🎙 语音转写（给模型补上声音）",
+    "collapsed": false,
+    "fields": {
+      "audio_transcribe_enabled": {
+        "type": "switch",
+        "name": "启用语音转写",
+        "default": true,
+        "hint": "把视频里的声音转成带时间轴的文字，一并交给模型——模型听不到音频，但能读到「谁在什么时候说了什么」。未填下面的 ASR 配置时自动跳过"
+      },
+      "bili_use_subtitle": {
+        "type": "switch",
+        "name": "B站视频优先用官方字幕",
+        "default": true,
+        "hint": "B站视频若带 CC/AI 字幕（精确时间轴、免费、不用跑 ASR），直接用它作为语音时间轴；没有字幕再回退到音频识别。AI 字幕需要在下方填了 B站 Cookie（B站配置里）才会返回"
+      },
+      "audio_stt_base_url": {
+        "type": "string",
+        "name": "ASR 接口地址",
+        "default": "",
+        "hint": "OpenAI 兼容的 /audio/transcriptions 端点，例如 https://api.siliconflow.cn/v1 。填了才会启用转写"
+      },
+      "audio_stt_api_key": {
+        "type": "sensitive",
+        "name": "ASR API Key",
+        "default": ""
+      },
+      "audio_stt_model": {
+        "type": "string",
+        "name": "ASR 模型名",
+        "default": "",
+        "hint": "如 whisper-1 / FunAudioLLM/SenseVoiceSmall / whisper-large-v3-turbo"
+      },
+      "audio_wait_sec": {
+        "type": "integer",
+        "name": "分析时最多等待(秒)",
+        "default": 30,
+        "hint": "转写通常在收到视频时就已在后台跑。分析时最多等这么久，超时就不带转写继续（绝不卡住分析）。调大＝更容易吃到转写，代价是分析可能多等一会儿；转写结果会落盘缓存，这次没等到、下次追问仍能用上"
+      },
+      "audio_max_sec": {
+        "type": "integer",
+        "name": "转写时长上限(秒)",
+        "default": 0,
+        "hint": "超过此时长的音频不转写，0 = 不限"
+      },
+      "audio_language": {
+        "type": "string",
+        "name": "语言提示",
+        "default": "",
+        "hint": "可选，如 zh / en；留空自动检测"
+      },
+      "audio_timeout_sec": {
+        "type": "integer",
+        "name": "ASR 请求超时(秒)",
+        "default": 300
+      },
+      "audio_silence_db": {
+        "type": "integer",
+        "name": "静音判定阈值(dB)",
+        "default": -35,
+        "hint": "ffmpeg 静音检测灵敏度，越小越严格。用于标出「有声音但没人说话」的片段（音乐/音效/环境音）"
+      },
+      "audio_gap_sec": {
+        "type": "float",
+        "name": "切块停顿阈值(秒)",
+        "default": 2.5,
+        "hint": "仅切块兜底路径用：相邻语音段间隔小于此值就并成一块。调小＝每句话一块、时间轴更准但调用更多；调大＝更快更省但时间轴变粗。默认 2.5 秒（自然对话的句子停顿通常在这个量级）"
+      },
+      "audio_block_sec": {
+        "type": "integer",
+        "name": "兜底切块长度(秒)",
+        "default": 30,
+        "hint": "仅当 ASR 不返回时间戳时（如 SenseVoice）才会切块逐段识别来补时间轴。越短时间轴越准但调用越多"
+      },
+      "audio_max_blocks": {
+        "type": "integer",
+        "name": "兜底切块数上限",
+        "default": 80
+      },
+      "audio_concurrency": {
+        "type": "integer",
+        "name": "兜底切块并发数",
+        "default": 5,
+        "hint": "仅切块兜底路径用。调大能显著缩短长视频转写时间（5 分钟视频：并发3约38秒、并发5约23秒），但别超过你 ASR 服务的并发限制"
+      },
+      "audio_use_proxy": {
+        "type": "switch",
+        "name": "ASR 走环境代理",
+        "default": false
+      }
+    }
+  },
   "section_session": {
     "type": "section",
     "name": "💬 会话管理",

@@ -286,6 +286,107 @@ async def download_bili_video(bvid, out_dir, info=None, cookie="",
 
 
 # ══════════════════════════════════════════════════════
+#  字幕（B 站官方 CC/AI 字幕，带精确时间轴）
+# ══════════════════════════════════════════════════════
+
+# 语言优先级：中文优先，其次英文
+_SUB_LAN_PRIORITY = ("zh-cn", "zh-hans", "zh", "ai-zh", "zh-tw", "ai-zh-tw", "en")
+
+
+async def get_subtitle_tracks(bvid, cid, cookie="", timeout=30.0, proxy_mode="auto"):
+    """取字幕轨列表 → [{lan, lan_doc, url}]
+
+    优先用 wbi 签名端点（新版 B 站要求），失败回退旧端点。
+    AI 生成的字幕需要登录 cookie 才会返回。
+    """
+    req = _Requester(cookie, timeout, proxy_mode)
+    params = {"bvid": bvid, "cid": cid}
+    data = None
+    try:
+        signed = await _wbi_sign(req, params)
+        d = await req.get_json(f"{API_BASE}/x/player/wbi/v2", signed)
+        if d.get("code") == 0:
+            data = d.get("data")
+    except Exception:
+        pass
+    if not data:
+        try:
+            d = await req.get_json(f"{API_BASE}/x/player/v2", params)
+            if d.get("code") == 0:
+                data = d.get("data")
+        except Exception:
+            pass
+    if not data:
+        return []
+    subs = (data.get("subtitle") or {}).get("subtitles") or []
+    out = []
+    for s in subs:
+        u = (s.get("subtitle_url") or "").strip()
+        if not u:
+            continue
+        if u.startswith("//"):
+            u = "https:" + u
+        elif u.startswith("/"):
+            u = "https://aisubtitle.hdslb.com" + u
+        out.append({"lan": (s.get("lan") or "").strip(),
+                    "lan_doc": (s.get("lan_doc") or "").strip(),
+                    "url": u})
+    return out
+
+
+def pick_subtitle_track(tracks, prefer=""):
+    """按语言挑一条字幕轨"""
+    if not tracks:
+        return None
+    if prefer:
+        p = prefer.strip().lower()
+        for t in tracks:
+            if t["lan"].lower() == p:
+                return t
+    for want in _SUB_LAN_PRIORITY:
+        for t in tracks:
+            if t["lan"].lower() == want:
+                return t
+    return tracks[0]
+
+
+async def fetch_subtitle_segments(url, timeout=60.0, proxy_mode="auto"):
+    """下载字幕 JSON → [{start, end, text}]（与 ASR 分段同构）"""
+    req = _Requester("", timeout, proxy_mode)
+    d = await req.get_json(url)
+    body = (d or {}).get("body") or []
+    segs = []
+    for it in body:
+        if not isinstance(it, dict):
+            continue
+        txt = str(it.get("content") or "").strip()
+        if not txt:
+            continue
+        try:
+            st = float(it.get("from") or 0)
+            en = float(it.get("to") or 0)
+        except (TypeError, ValueError):
+            continue
+        segs.append({"start": st, "end": en, "text": txt})
+    return segs
+
+
+async def get_bilibili_subtitle(bvid, cid, cookie="", prefer_lan="", timeout=30.0,
+                                proxy_mode="auto"):
+    """一步到位：取字幕轨 → 挑一条 → 下载 → 返回 (segments, lan_doc, 轨数量)
+
+    没有字幕时返回 ([], "", 0)。
+    """
+    tracks = await get_subtitle_tracks(bvid, cid, cookie, timeout, proxy_mode)
+    if not tracks:
+        return [], "", 0
+    track = pick_subtitle_track(tracks, prefer_lan) or tracks[0]
+    segs = await fetch_subtitle_segments(track["url"], timeout=timeout,
+                                         proxy_mode=proxy_mode)
+    return segs, track.get("lan_doc") or track.get("lan") or "", len(tracks)
+
+
+# ══════════════════════════════════════════════════════
 #  BV 号提取
 # ══════════════════════════════════════════════════════
 
