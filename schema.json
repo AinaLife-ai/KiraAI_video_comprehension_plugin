@@ -160,6 +160,12 @@
         "default": "native",
         "hint": "native=传视频URL给模型；frames=本地抽帧拼图后传图片"
       },
+      "native_audio_1": {
+        "type": "switch",
+        "name": "模型自带音视频理解(跳过语音识别)",
+        "default": false,
+        "hint": "开启后，bot 用本组分析视频时**跳过语音识别（ASR）**转写 —— 适用于**模型自带音视频理解**的模型（如 MiMo、Gemini 原生）。使用本组可无需额外语音识别，如只用本组可直接关闭语音识别选项。⚠️ 模型其实听不到音频的（如 GLM、Qwen 这类只抽帧的）请**关掉**，否则会连转写文字都没有，反而丢失声音信息。注意：B站字幕不受此开关影响，仍然会用"
+      },
       "api_base_1": {
         "type": "string",
         "name": "API 地址",
@@ -199,7 +205,7 @@
   },
   "section_model_2": {
     "type": "section",
-    "name": "📦 模型组 2（Qwen3-VL 推荐）",
+    "name": "📦 模型组 2（MiMo 全模态 推荐）",
     "collapsed": false,
     "fields": {
       "enabled_2": {
@@ -210,7 +216,8 @@
       "model_name_2": {
         "type": "string",
         "name": "模型名称",
-        "default": "qwen3.8-max"
+        "default": "mimo-v2.5",
+        "hint": "小米 MiMo 全模态模型（原生理解图像/视频/音频/文本，1M 上下文）"
       },
       "label_2": {
         "type": "string",
@@ -227,10 +234,16 @@
         ],
         "default": "native"
       },
+      "native_audio_2": {
+        "type": "switch",
+        "name": "模型自带音视频理解(跳过语音识别)",
+        "default": true,
+        "hint": "开启后，bot 用本组分析视频时**跳过语音识别（ASR）**转写 —— 适用于**模型自带音视频理解**的模型（如 MiMo、Gemini 原生）。使用本组可无需额外语音识别，如只用本组可直接关闭语音识别选项。⚠️ 模型其实听不到音频的（如 GLM、Qwen 这类只抽帧的）请**关掉**，否则会连转写文字都没有，反而丢失声音信息。注意：B站字幕不受此开关影响，仍然会用"
+      },
       "api_base_2": {
         "type": "string",
         "name": "API 地址",
-        "default": "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        "default": "https://api.xiaomimimo.com/v1"
       },
       "api_key_2": {
         "type": "sensitive",
@@ -263,7 +276,7 @@
   },
   "section_model_3": {
     "type": "section",
-    "name": "📦 模型组 3（Gemini 2.5 推荐）",
+    "name": "📦 模型组 3（Gemini 原生 推荐 frames）",
     "collapsed": true,
     "fields": {
       "enabled_3": {
@@ -289,12 +302,20 @@
           "native",
           "frames"
         ],
-        "default": "native"
+        "default": "native",
+        "hint": "native = 走 Gemini **原生 API**（generateContent + inline_data，音视频一起理解）；frames = 传拼图（更省，且兼容性最好）"
+      },
+      "native_audio_3": {
+        "type": "switch",
+        "name": "模型自带音视频理解(跳过语音识别)",
+        "default": true,
+        "hint": "开启后，bot 用本组分析视频时**跳过语音识别（ASR）**转写 —— 适用于**模型自带音视频理解**的模型（如 MiMo、Gemini 原生）。使用本组可无需额外语音识别，如只用本组可直接关闭语音识别选项。⚠️ 模型其实听不到音频的（如 GLM、Qwen 这类只抽帧的）请**关掉**，否则会连转写文字都没有，反而丢失声音信息。注意：B站字幕不受此开关影响，仍然会用"
       },
       "api_base_3": {
         "type": "string",
         "name": "API 地址",
-        "default": "https://generativelanguage.googleapis.com/v1beta/openai"
+        "default": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "hint": "填 https://generativelanguage.googleapis.com/v1beta 即可（插件会自动走原生 API）；填带 /openai 的兼容端点也能用，会自动归一化"
       },
       "api_key_3": {
         "type": "sensitive",
@@ -354,6 +375,12 @@
           "native"
         ],
         "default": "frames"
+      },
+      "native_audio_4": {
+        "type": "switch",
+        "name": "模型自带音视频理解(跳过语音识别)",
+        "default": false,
+        "hint": "开启后，bot 用本组分析视频时**跳过语音识别（ASR）**转写 —— 适用于**模型自带音视频理解**的模型（如 MiMo、Gemini 原生）。使用本组可无需额外语音识别，如只用本组可直接关闭语音识别选项。⚠️ 模型其实听不到音频的（如 GLM、Qwen 这类只抽帧的）请**关掉**，否则会连转写文字都没有，反而丢失声音信息。注意：B站字幕不受此开关影响，仍然会用"
       },
       "api_base_4": {
         "type": "string",

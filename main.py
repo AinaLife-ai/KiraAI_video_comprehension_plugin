@@ -868,11 +868,20 @@ class VideoComprehensionPlugin(BasePlugin):
             logger.warning("[VC] 视频缓存失败: %s", e)
         return ""
 
+    def _any_group_needs_stt(self) -> bool:
+        """是否还有模型组需要 ASR 转写（即：不是所有启用的组都自带音视频理解）"""
+        if not self._profiles:
+            return True
+        return any(not p.native_audio for p in self._profiles)
+
     async def _cache_then_transcribe(self, sid: str, url: str, name: str = ""):
-        """缓存视频后立刻并行启动语音转写（这样 bot 真要分析时通常已算好）"""
+        """缓存视频后立刻并行启动转写（这样 bot 真要分析时通常已算好）
+
+        若当前启用的模型组**全部**自带音视频理解（不需要 STT），就不再跑 ASR。
+        """
         path = await self._cache_incoming_video(sid, url, name)
         if path:
-            self._start_transcript_task(path)
+            self._start_transcript_task(path, skip_asr=not self._any_group_needs_stt())
 
     # ── 语音转写（把"声音"变成模型读得到的文字） ──
 
@@ -944,7 +953,8 @@ class VideoComprehensionPlugin(BasePlugin):
                     len(blocks), sum(1 for x in results if x))
         return [x for x in results if x]
 
-    async def _build_transcript(self, video_path: str, bvid: str = "", cid: int = 0) -> dict:
+    async def _build_transcript(self, video_path: str, bvid: str = "", cid: int = 0,
+                                skip_asr: bool = False) -> dict:
         """完整转写流程。
 
         ① B 站视频优先用**官方字幕**（精确时间轴、免费、不用抽音轨）
@@ -981,6 +991,10 @@ class VideoComprehensionPlugin(BasePlugin):
                 logger.info("[VC] 该 B 站视频无可用字幕，转音频识别")
             except Exception as e:
                 logger.info("[VC] B 站字幕获取失败，转音频识别: %s", e)
+        # ② 音频识别（自带音视频理解的模型不需要）
+        if skip_asr:
+            logger.info("[VC] 该模型组自带音视频理解，跳过语音识别")
+            return {}
         if not self._asr_ready():
             return {}
         work = os.path.join(self.other_cache_dir, f".asr_{key}")
@@ -1028,10 +1042,13 @@ class VideoComprehensionPlugin(BasePlugin):
             logger.warning("[VC] 语音转写异常（不影响视频分析）: %s", e)
         return {}
 
-    def _start_transcript_task(self, video_path: str, bvid: str = "", cid: int = 0):
+    def _start_transcript_task(self, video_path: str, bvid: str = "", cid: int = 0,
+                               skip_asr: bool = False):
         """后台启动转写（与视频缓存并行，拿到就缓存好，分析时零等待）"""
         want_sub = bool(self.bili_use_subtitle and bvid and cid)
         if not self.audio_enabled or (not want_sub and not self._asr_ready()):
+            return
+        if skip_asr and not want_sub:
             return
         if not video_path or not os.path.isfile(video_path):
             return
@@ -1040,7 +1057,8 @@ class VideoComprehensionPlugin(BasePlugin):
             return
         if self._load_transcript(key):
             return
-        task = asyncio.create_task(self._build_transcript(video_path, bvid=bvid, cid=cid))
+        task = asyncio.create_task(self._build_transcript(video_path, bvid=bvid, cid=cid,
+                                                          skip_asr=skip_asr))
         self._asr_tasks[key] = task
 
         def _cleanup(_t, k=key):
@@ -1049,7 +1067,8 @@ class VideoComprehensionPlugin(BasePlugin):
         task.add_done_callback(_cleanup)
 
     async def _get_transcript(self, video_path: str, wait: float,
-                              bvid: str = "", cid: int = 0) -> dict:
+                              bvid: str = "", cid: int = 0,
+                              skip_asr: bool = False) -> dict:
         """取转写结果：缓存命中→秒用；有进行中任务→最多等 wait 秒；否则现场跑"""
         want_sub = bool(self.bili_use_subtitle and bvid and cid)
         if not self.audio_enabled or (not want_sub and not self._asr_ready()):
@@ -1062,7 +1081,7 @@ class VideoComprehensionPlugin(BasePlugin):
             return cached
         task = self._asr_tasks.get(key)
         if task is None or task.done():
-            self._start_transcript_task(video_path, bvid=bvid, cid=cid)
+            self._start_transcript_task(video_path, bvid=bvid, cid=cid, skip_asr=skip_asr)
             task = self._asr_tasks.get(key)
         if task is None:
             return {}
@@ -1683,7 +1702,8 @@ class VideoComprehensionPlugin(BasePlugin):
         tr = await self._get_transcript(raw_path, self.audio_wait_sec,
                                        bvid=bvid if stype == "bilibili" else "",
                                        cid=int((info or {}).get("cid") or 0)
-                                       if stype == "bilibili" else 0)
+                                       if stype == "bilibili" else 0,
+                                       skip_asr=profile.native_audio)
         tdoc = tr.get("doc", "") or ""
         analysis, label, downgrade_note, host_url = await self._analyze_result(
             profile, result, real_segs, question, work, transcript_doc=tdoc,
@@ -1946,7 +1966,8 @@ class VideoComprehensionPlugin(BasePlugin):
             return f"⚠️ 处理失败：{result.get('error', result['status'])}"
 
         # 转写：优先用缓存/进行中的任务，超时就不带（不卡住）
-        tr = await self._get_transcript(path, self.audio_wait_sec)
+        tr = await self._get_transcript(path, self.audio_wait_sec,
+                                        skip_asr=profile.native_audio)
         analysis, label, note, host_url = await self._analyze_result(
             profile, result, real, question, work,
             transcript_doc=self._clip_transcript(tr, real))
