@@ -14,6 +14,12 @@ from pathlib import Path
 
 import httpx
 
+try:                      # 有 KiraAI 就用它的 logger，没有也不影响独立使用
+    from core.plugin import logger
+except Exception:         # pragma: no cover
+    import logging
+    logger = logging.getLogger("VC.bili")
+
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 REFERER = "https://www.bilibili.com"
 HEADERS = {"User-Agent": UA, "Referer": REFERER}
@@ -224,11 +230,47 @@ async def _get_video_urls(req, bvid, cid, quality_hint: int = 0):
     return {"video_url": video_url or (durl[0]["url"] if durl else None), "audio_url": audio_url}
 
 
+async def get_bili_direct_url(bvid, cid, cookie="", timeout=30.0, proxy_mode="auto"):
+    """取 B 站 **html5 MP4 直链**（音视频合一）。
+
+    用 `fnval=1 + platform=html5` 走 B 站的 MP4 接口，特点是：
+      - **不需要 Referer**（实测不带 Referer 也能拉）
+      - **音视频合一**：下载后不用 ffmpeg 合并
+      - 代价：清晰度上限较低（通常 360p/480p），但足够给模型分析
+
+    返回 (url, quality_code, length_ms)。
+    """
+    req = _Requester(cookie, timeout, proxy_mode)
+    params = {"bvid": bvid, "cid": cid, "fnval": 1, "platform": "html5", "high_quality": 1}
+    d = await req.get_json(f"{API_BASE}/x/player/playurl", params)
+    if d.get("code") != 0:
+        try:
+            signed = await _wbi_sign(req, params)
+            d = await req.get_json(f"{API_BASE}/x/player/wbi/playurl", signed)
+        except Exception:
+            pass
+    if d.get("code") != 0:
+        raise BiliError(f"获取B站直链失败 (code={d.get('code')})")
+    data = d.get("data") or {}
+    durl = data.get("durl") or []
+    if not durl:
+        raise BiliError("该视频没有可用的 MP4 直链")
+    first = durl[0]
+    url = (first.get("url") or "").strip()
+    if not url:
+        raise BiliError("MP4 直链为空")
+    return url, int(data.get("quality") or 0), int(first.get("length") or 0)
+
+
 async def download_bili_video(bvid, out_dir, info=None, cookie="",
                                timeout=120.0, max_seconds=0, proxy_mode="auto",
-                               quality: str = "") -> tuple[str, dict]:
-    """下载 B 站视频（按 quality 选对应档，不下原画再压缩）
-    quality: "low"(360p), "medium"(720p), "original"(最高), 空=low
+                               quality: str = "",
+                               prefer_html5: bool = True) -> tuple[str, dict]:
+    """下载 B 站视频。
+
+    默认先走 **html5 MP4 直链**：单文件、音视频合一、不用 ffmpeg 合并、
+    也不需要 Referer —— 少下一个流、少一步合并，更快更稳。
+    拿不到（接口变动/风控/无 MP4 源）自动回退原来的 DASH 流程。
     """
     quality_hint = {"low": 360, "medium": 720, "original": 0}.get(quality, 360)
     out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
@@ -241,6 +283,23 @@ async def download_bili_video(bvid, out_dir, info=None, cookie="",
     if fpath.exists() and fpath.stat().st_size > 0:
         return str(fpath), info
 
+    # ① 优先：html5 MP4 单文件（免合并）
+    if prefer_html5:
+        try:
+            direct, qcode, _ms = await get_bili_direct_url(
+                bvid, info["cid"], cookie, timeout, proxy_mode)
+            await req.stream(direct, fpath)
+            if fpath.exists() and fpath.stat().st_size > 0:
+                logger.info("[VC] B站视频下载完成（html5 MP4 单文件，quality=%s）", qcode)
+                return str(fpath), info
+        except Exception as e:
+            logger.info("[VC] html5 MP4 直链不可用，回退 DASH 流程: %s", e)
+            try:
+                if fpath.exists(): fpath.unlink()
+            except Exception:
+                pass
+
+    # ② 回退：DASH（视频流 + 音频流 + ffmpeg 合并）
     urls = await _get_video_urls(req, bvid, info["cid"], quality_hint=quality_hint)
     if not urls["video_url"]: raise BiliError("无法获取视频下载链接")
 

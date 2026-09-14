@@ -46,7 +46,8 @@ from video_host import upload_to_any, UploadError, DEFAULT_HOSTS as DEFAULT_UPLO
 from llm_proxy import (ModelProfile, select_model, build_meta, analyze_frames,
                        analyze_native, NATIVE_MAX_MB, _as_dict)
 from bili_dl import (search_bili, get_bili_info, get_ai_summary, download_bili_video,
-                     extract_bvid, BiliError, get_bilibili_subtitle)
+                     extract_bvid, BiliError, get_bilibili_subtitle,
+                     get_bili_direct_url)
 
 BILI_RE = re.compile(r"(BV[0-9A-Za-z]{10}|b23\.tv/[^\s]+|bilibili\.com/(?:video/|BV))", re.I)
 BVID_RE = re.compile(r"BV[0-9A-Za-z]{10}")
@@ -202,7 +203,7 @@ class VideoComprehensionPlugin(BasePlugin):
         self.audio_base_url = str(au.get("audio_stt_base_url", "") or "").strip()
         self.audio_api_key = str(au.get("audio_stt_api_key", "") or "").strip()
         self.audio_model = str(au.get("audio_stt_model", "") or "").strip()
-        self.audio_wait_sec = float(au.get("audio_wait_sec", 30) or 30)
+        self.audio_wait_sec = float(au.get("audio_wait_sec", 60) or 60)
         self.audio_max_sec = float(au.get("audio_max_sec", 0) or 0)
         self.audio_language = str(au.get("audio_language", "") or "").strip()
         self.audio_timeout = float(au.get("audio_timeout_sec", 300) or 300)
@@ -210,6 +211,7 @@ class VideoComprehensionPlugin(BasePlugin):
         self.audio_block_sec = float(au.get("audio_block_sec", 30) or 30)
         self.audio_gap_sec = float(au.get("audio_gap_sec", 2.5) or 2.5)
         self.bili_use_subtitle = bool(au.get("bili_use_subtitle", True))
+        self.bili_direct_url = bool(bs.get("bili_direct_url", True))
         self.audio_extra_headers = _as_dict(au.get("audio_stt_extra_headers"))
         self.audio_extra_body = _as_dict(au.get("audio_stt_extra_body"))
         self.cache_scope = str(cs.get("cache_scope", "mentioned") or "mentioned").strip().lower()
@@ -1684,7 +1686,9 @@ class VideoComprehensionPlugin(BasePlugin):
                                        if stype == "bilibili" else 0)
         tdoc = tr.get("doc", "") or ""
         analysis, label, downgrade_note, host_url = await self._analyze_result(
-            profile, result, real_segs, question, work, transcript_doc=tdoc)
+            profile, result, real_segs, question, work, transcript_doc=tdoc,
+            bili_bvid=bvid if stype == "bilibili" else "",
+            bili_cid=int((info or {}).get("cid") or 0) if stype == "bilibili" else 0)
         sess.analysis = analysis; sess.analysis_model = label; sess.analysis_mode = profile.mode
         sess.model_tag = profile.label or str(profile.group)   # 记住，供追问沿用
         if host_url:
@@ -1737,7 +1741,8 @@ class VideoComprehensionPlugin(BasePlugin):
                 " ".join(f"[{_ts(s)}-{_ts(e)}]" for s, e in segs) + "\n")
 
     async def _analyze_result(self, profile, result, segs, question, work,
-                              transcript_doc: str = ""):
+                              transcript_doc: str = "", bili_bvid: str = "",
+                              bili_cid: int = 0):
         """按 模式 + 段数 选择分析路径，返回 (analysis, label, note, host_url)。
 
         - native + 单段 → 秒切该段片段（含音频）传给模型
@@ -1815,7 +1820,19 @@ class VideoComprehensionPlugin(BasePlugin):
                     vpath, size_mb = small, new_mb
                 except Exception as e:
                     logger.warning("[VC] 上传前压缩失败，按原文件上传: %s", e)
-            url = await _upload_or_none(vpath)
+            url = ""
+            # ★ B 站视频 + 开启直传 → 直接用 html5 MP4 直链交给模型，省一次上传
+            #   仅限全片：时间段分析用的是裁剪片段，没有对应直链
+            if self.bili_direct_url and bili_bvid and is_full:
+                try:
+                    direct, _q, _ms = await get_bili_direct_url(
+                        bili_bvid, bili_cid, self.bili_cookie, self.dl_timeout)
+                    url = direct
+                    logger.info("[VC] B站视频走直链交给模型（免上传）")
+                except Exception as e:
+                    logger.info("[VC] B站直链不可用，回退上传: %s", e)
+            if not url:
+                url = await _upload_or_none(vpath)
             if not url and size_mb > NATIVE_MAX_MB:
                 # 没上传成功且超过 base64 上限 → 压到能内联
                 try:
@@ -1826,10 +1843,13 @@ class VideoComprehensionPlugin(BasePlugin):
                     logger.warning("[VC] base64 回退压缩失败: %s", e)
             ans = await analyze_native(profile, vpath, question, ask_prompt,
                                        video_url=url)
-            tag = "native URL" if url else "native base64"
+            is_direct = bool(url) and (
+                not self.upload_host or "bilivideo.com" in url or "bilibili" in url)
+            tag = "native B站直链" if is_direct else ("native URL" if url else "native base64")
             if not is_full:
                 tag += " 片段"
-            return ans, clip_note, tag, url
+            # B站直链有时效、且对外不好用（需要 UA），不写进「视频直链」提示
+            return ans, clip_note, tag, ("" if is_direct else url)
 
         # native（全片或单段都走；多段走帧模式）
         if profile.mode == "native" and not multi:

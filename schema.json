@@ -508,6 +508,12 @@
         "default": "low",
         "hint": "low=360p，medium=720p，original=原画。下载时直接选对应档位，不下原画再压"
       },
+      "bili_direct_url": {
+        "type": "switch",
+        "name": "B站视频直链直传(免上传)",
+        "default": true,
+        "hint": "开启后，B站视频做 native 分析时直接用B站的 html5 MP4 直链交给模型，省掉一次上传。注意：能否成功取决于模型服务端拉流用的 User-Agent（空UA/python-requests 会被B站拦），试不通就关掉它回退上传"
+      },
       "bili_compress_quality": {
         "type": "string",
         "name": "B站压缩质量(下载后再压)",
@@ -653,8 +659,8 @@
       "audio_wait_sec": {
         "type": "integer",
         "name": "分析时最多等待(秒)",
-        "default": 30,
-        "hint": "转写通常在收到视频时就已在后台跑。分析时最多等这么久，超时就不带转写继续（绝不卡住分析）。调大＝更容易吃到转写，代价是分析可能多等一会儿；转写结果会落盘缓存，这次没等到、下次追问仍能用上"
+        "default": 60,
+        "hint": "转写通常在收到视频时就已在后台跑。分析时最多等这么久，超时就不带转写继续（绝不卡住分析）。默认 60 秒 —— 给长视频留余量（实测 5 分 52 秒的视频转写约 25 秒，但网络/服务慢时会更久）。转写结果会落盘缓存，这次没等到、下次追问仍能用上"
       },
       "audio_max_sec": {
         "type": "integer",
