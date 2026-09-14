@@ -529,6 +529,20 @@ class VideoComprehensionPlugin(BasePlugin):
     def _sid(self, event) -> str:
         return getattr(event.session, "sid", None) or getattr(event, "sid", "") or ""
 
+    @staticmethod
+    def _msg_id(event) -> str:
+        """取消息 ID（用于在上下文里精确定位某条消息）。取不到就返回空串。"""
+        try:
+            for holder in (getattr(event, "message", None), event):
+                if holder is None:
+                    continue
+                v = getattr(holder, "message_id", None)
+                if v:
+                    return str(v)
+        except Exception:
+            pass
+        return ""
+
     def _is_qq(self, event) -> bool:
         """判断是否 QQ 平台（platform 来自适配器 manifest.name，内置为 "QQ"，大小写不敏感）"""
         return str(getattr(event.adapter, "platform", "") or "").strip().lower() == "qq"
@@ -613,10 +627,20 @@ class VideoComprehensionPlugin(BasePlugin):
                     if m: bvid = m.group(0)
 
         if not bvid: return
-        logger.info("[VC] auto_send 检测到B站视频: %s", bvid)
-        asyncio.create_task(self._auto_send_do(bvid, event.adapter.name, sid))
+        # 记录"用来在上下文里定位这条消息"的匹配键。
+        # ⚠️ 不能只用 bvid：消息里写的可能是 b23 短链（V5Xhy88 这种），
+        #    或藏在 QQ 小程序卡片的 qqdocurl 里，用 BV 号是匹配不上的。
+        match_keys = [bvid]
+        m2 = re.search(r'b23\.tv/([0-9A-Za-z]+)', text)
+        if m2:
+            match_keys.append(m2.group(1))
+        mid = self._msg_id(event)
+        logger.info("[VC] auto_send 检测到B站视频: %s（匹配键=%s）", bvid, match_keys)
+        asyncio.create_task(self._auto_send_do(bvid, event.adapter.name, sid,
+                                               match_keys=match_keys, message_id=mid))
 
-    async def _auto_send_do(self, bvid: str, adapter_name: str, sid: str):
+    async def _auto_send_do(self, bvid: str, adapter_name: str, sid: str,
+                            match_keys: list | None = None, message_id: str = ""):
         """异步后台发送，成功后记录 auto_sent 用于 LLM 上下文标注"""
         try:
             reply = await self._send_video_by_bvid(None, bvid, sid=sid, adapter_name=adapter_name)
@@ -630,6 +654,10 @@ class VideoComprehensionPlugin(BasePlugin):
                     "bvid": bvid,
                     "title": title,
                     "file_path": reply.split("本地路径:")[-1].strip() if "本地路径:" in reply else "",
+                    # 用于在 LLM 上下文里定位原始消息（短链/卡片消息不能靠 bvid 匹配）
+                    "match_keys": list(match_keys or [bvid]),
+                    "message_id": str(message_id or ""),
+                    "ts": time.time(),
                 }
             elif reply:
                 # 失败 → 补发文字提示
@@ -680,13 +708,23 @@ class VideoComprehensionPlugin(BasePlugin):
         if not self.enabled: return
         sid = getattr(event.session, "sid", None)
         if not sid: return
-        sent = self._auto_sent.pop(sid, None)
+        # ⚠️ 这里**不能**先 pop：万一这一轮没匹配到（比如消息还没进批次），
+        #    记录就被永久丢掉了。匹配成功后再删；超时（5 分钟）才丢弃。
+        sent = self._auto_sent.get(sid)
         if not sent: return
+        if time.time() - float(sent.get("ts") or 0) > 300:
+            self._auto_sent.pop(sid, None)
+            return
         note = (
             f"\n[系统提示：该B站视频（《{sent['title']}》"
             f"BV:{sent['bvid']}）已自动发送压缩版视频（{sent.get('file_path','')}）]"
         )
         bvid = sent["bvid"]
+        # 匹配键：bvid + b23 短链 id（消息里写的可能是短链或藏在卡片里）
+        keys = [k for k in (sent.get("match_keys") or []) if k]
+        if bvid not in keys:
+            keys.append(bvid)
+        want_mid = str(sent.get("message_id") or "")
         # 按顺序遍历 messages ↔ user_prompt，定位原始消息追加 note
         prompt_idx = 0
         for msg in event.messages:
@@ -699,9 +737,17 @@ class VideoComprehensionPlugin(BasePlugin):
                 break
             p = req.user_prompt[prompt_idx]
             prompt_idx += 1
-            msg_text = "".join(e.text for e in msg.chain if isinstance(e, Text))
-            if bvid in msg_text:
+            # ① 消息 ID 精确匹配（最可靠）
+            hit = bool(want_mid) and want_mid == self._msg_id(msg)
+            # ② 回退：扫描整条消息链的文本（**不只 Text 元素**，
+            #    这样 QQ 小程序卡片里的 qqdocurl 也能被扫到）
+            if not hit:
+                msg_text = _collect_chain_text(getattr(msg, "chain", None))
+                hit = any(k in msg_text for k in keys)
+            if hit:
                 p.content += note
+                self._auto_sent.pop(sid, None)   # 标注成功 → 消费掉
+                logger.info("[VC] 已在上下文里标注「已自动发送」: %s", bvid)
                 break
 
     # ── 改写消息里的视频占位（让 bot 拿到可用的路径，而不是"没缓存"） ──
