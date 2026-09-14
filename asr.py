@@ -238,13 +238,20 @@ async def transcribe(audio_path: str, base_url: str, api_key: str, model: str, *
                 continue
             body = resp.text or ""
             try:
-                parsed = parse_transcript(json.loads(body))
+                payload = json.loads(body)
             except Exception:
-                parsed = parse_transcript(body)
-            if parsed.get("text") or parsed.get("segments"):
+                payload = None
+            parsed = parse_transcript(payload if payload is not None else body)
+            # ⚠️ HTTP 200 + 合法 JSON 且含 text 字段 = **有效响应**，
+            #    即使 text 为空也属于"这段音频没有人声"，不能当失败去重试
+            #    （否则一个静音视频会白调 3 次 ASR）
+            if (parsed.get("text") or parsed.get("segments")
+                    or (isinstance(payload, dict) and "text" in payload)):
                 parsed["http_form"] = form.get("response_format", "default")
+                if not parsed.get("text") and not parsed.get("segments"):
+                    parsed["silent"] = True          # 标记：识别成功但无语音
                 return parsed
-            last_err = f"返回内容为空: {body[:160]}"
+            last_err = f"返回内容既没有 text 也不是可解析 JSON: {body[:160]}"
     raise ASRError(f"转写失败: {last_err}")
 
 
