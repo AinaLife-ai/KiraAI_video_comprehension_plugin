@@ -333,6 +333,8 @@ analyze_video(session_id="abc123", segments=[[10,30],[100,130]])   # 一次多�
 
 ## 版本
 
+- 1.13.2 — `bvid` 传了无效内容时给出可读提示（原来会冒裸异常 `ValueError: unknown url type`）；新增 `test_bot_errors.py` 模拟 bot 各种乱传参数（16 种场景），验证「要么正确执行、要么给清晰错误」
+- 1.13.1 — **模式隔离加硬约束**：`analyze_native()` 内部拦截非 native 模式的模型组（此前只靠调用点写对，属隐式正确）；新增 `test_mode_isolation.py` 覆盖全片/单段/多段/追问四条路径，确认 frames 组**从无 video_url**
 - 1.13.0 — **按名字指定模型组**（每组可填「模型别名」，bot 可 `model="Agnes"`）；**修复 ASR 认证头从未发出**（导致所有转写 401 Token is invalid）；适配器白名单默认改为空（不再写死 qq，非 QQ 平台也能检测视频）；上传换链接默认开启
 - 1.12.1 — ASR 支持自定义请求头（`audio_stt_extra_headers`）与额外表单字段（`audio_stt_extra_body`），关键字段受保护不被覆盖
 - 1.12.0 — 新增**B站官方字幕优先**（`bili_use_subtitle`）：B站视频有 CC/AI 字幕时直接用它做时间轴（精确、免费、不跑 ASR、不抽音轨），没有才回退音频识别；AI 字幕需 B站 Cookie

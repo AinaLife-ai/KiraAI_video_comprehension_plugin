@@ -1289,8 +1289,13 @@ class VideoComprehensionPlugin(BasePlugin):
 
         if bvid:
             bvid = bvid.strip()
-            if not bvid.startswith("BV"): bvid = (await extract_bvid(bvid)) or ""
-            if bvid: source_type = "bilibili"; source_url = f"https://www.bilibili.com/video/{bvid}"
+            if not bvid.startswith("BV"):
+                bvid = (await extract_bvid(bvid)) or ""
+            if not bvid:
+                return ("⚠️ 没从 bvid 参数里认出有效的 BV 号。"
+                        "请传 BV 号（如 BV1xx411c7mD）或完整链接；"
+                        "要分析本地文件请用 local_path 参数。")
+            source_type = "bilibili"; source_url = f"https://www.bilibili.com/video/{bvid}"
         elif local_path:
             lp = local_path.strip()
             if os.path.isabs(lp) and os.path.isfile(lp): source_url = lp
