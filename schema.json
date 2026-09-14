@@ -524,6 +524,12 @@
         "default": false,
         "hint": "开启后检测到消息中的B站链接/BV号，自动下载压缩视频并发送到群/私聊，不消耗token"
       },
+      "napcat_stream_upload": {
+        "type": "switch",
+        "name": "大文件分块上传(仅 NapCat 扩展)",
+        "default": false,
+        "hint": "**默认关闭**。这是 NapCat 的第三方扩展 action（upload_file_stream），官方 NapCat 没有它，同类软件（AstrBot 等）也不用它 —— 默认直接用本地路径发送即可，NapCat / SnowLuma 都能读。\n⚠️ 若你的协议端在发送视频时出现 WebSocket 断开 / 程序退出，请**保持关闭**。\n只有在你确实需要跨机器上传（客户端和 bot 不在同一台机器）时才开启。"
+      },
       "bili_download_quality": {
         "type": "string",
         "name": "B站下载质量",
