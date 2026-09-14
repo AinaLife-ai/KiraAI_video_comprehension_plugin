@@ -64,7 +64,7 @@ class VideoSession:
         "file_size_mb", "compressed_size_mb",
         "analysis", "analysis_model", "analysis_mode",
         "history", "last_interact", "bili_ai_summary",
-        "host_url", "transcript_doc",
+        "host_url", "transcript_doc", "model_tag",
     )
     def __init__(self, session_id, sid, source, source_url):
         self.session_id = session_id
@@ -88,6 +88,7 @@ class VideoSession:
         self.bili_ai_summary = None
         self.host_url = ""          # 上传到文件中转后的公开直链（若有）
         self.transcript_doc = ""    # 语音转写时间轴文档（若有）
+        self.model_tag = ""         # 该会话首次分析用的模型组（追问默认沿用，避免"换模型"）
 
     def is_stale(self, ttl: int) -> bool:
         return time.time() - self.last_interact > ttl * 60
@@ -866,6 +867,9 @@ class VideoComprehensionPlugin(BasePlugin):
                 segs = normalize_segments_by_duration(segs, total)
             if not segs and (result.get("text") or "").strip() and speech:
                 segs = await self._segment_transcribe(wav, speech, work)
+            if result.get("silent") and not segs:
+                logger.info("[VC] 音频识别完成：这段 %.1fs 音频里没有可转写的语音", total)
+            # 即使没有语音，也把「有声但无人声」的片段标出来（L2）
             doc = build_timeline_doc(segs, speech, total)
             data = {
                 "doc": doc, "segments": segs,
@@ -1234,8 +1238,10 @@ class VideoComprehensionPlugin(BasePlugin):
         description=("分析视频内容。支持QQ视频/B站视频/本地路径。首次返回session_id，追问传回。"
                      "只看某一段时间就传 start_sec/end_sec（数字秒）；一次看多段传 segments=[[起,止],...]（最多5段、每段≤300秒）。"
                      "时间段分析会复用已下载的视频，不会重新下载。"
-                     "用户指定了模型（如「用 Agnes 分析」）就传 model=那个名字；不确定有哪些可选就先不传，"
-                     "传错时返回值会列出全部可用模型组。"),
+                     "用户指定了模型（如「用 Agnes 分析」）就传 model=那个名字；"
+                     "**同一次对话里后续的每次调用（包括追问）都要继续带上同一个 model**，"
+                     "否则会退回默认模型组、可能答非所问。"
+                     "不确定有哪些可选就先不传，传错时返回值会列出全部模型组。"),
         params={
             "type": "object",
             "properties": {
@@ -1345,12 +1351,17 @@ class VideoComprehensionPlugin(BasePlugin):
 
     # ── 模型组选择（支持按别名/模型名/组号指定） ──
 
-    def _find_profile(self, spec: str):
+    def _find_profile(self, spec):
         """按「别名 → 模型名 → 组号」找模型组；找不到返回 None。
 
         让 bot 能听懂「用 Agnes 抽帧分析这个」这类指令。
+        spec 既可以是字符串（别名/模型名/组号），也可以已经是 ModelProfile 对象。
         """
-        s = (spec or "").strip()
+        if spec is None:
+            return None
+        if isinstance(spec, ModelProfile):
+            return spec
+        s = str(spec).strip()
         if not s:
             return None
         if s.isdigit():
@@ -1533,6 +1544,7 @@ class VideoComprehensionPlugin(BasePlugin):
         analysis, label, downgrade_note, host_url = await self._analyze_result(
             profile, result, real_segs, question, work, transcript_doc=tdoc)
         sess.analysis = analysis; sess.analysis_model = label; sess.analysis_mode = profile.mode
+        sess.model_tag = profile.label or str(profile.group)   # 记住，供追问沿用
         if host_url:
             sess.host_url = host_url
         if tdoc:
@@ -1724,8 +1736,12 @@ class VideoComprehensionPlugin(BasePlugin):
         if not real:
             return (f"⚠️ 时间段超出视频时长（视频共 {sess.duration:.1f}s）")
         total = sum(e - s for s, e in real)
-        profile = (model_spec or select_model(self._profiles, total, self.default_model)
-                   or self._profiles[0])
+        spec = model_spec or sess.model_tag               # 同样沿用会话的模型
+        profile = (self._find_profile(spec) if spec else None) \
+            or select_model(self._profiles, total, self.default_model) \
+            or self._profiles[0]
+        if model_spec:
+            sess.model_tag = profile.label or str(profile.group)
 
         work = os.path.join(os.path.dirname(path), f"seg_{int(time.time()*1000) % 10**9}")
         os.makedirs(work, exist_ok=True)
@@ -1769,9 +1785,15 @@ class VideoComprehensionPlugin(BasePlugin):
         if not sess.grids_base64:
             return (f"只有{sess.analysis_mode}结果，深度分析后可追问画面。\n"
                     f"{self._link_line(sess.host_url)}已有: {sess.analysis[:200]}")
-        profile = (model_spec or select_model(self._profiles, sess.duration, self.default_model)
-                   or (self._profiles[0] if self._profiles else None))
+        # 模型粘性：追问没指定 model 时，沿用该会话首次分析用的那一组，
+        # 而不是退回默认优先级（否则「同一个视频前后换了模型」）
+        spec = model_spec or sess.model_tag
+        profile = (self._find_profile(spec) if spec else None) \
+            or select_model(self._profiles, sess.duration, self.default_model) \
+            or (self._profiles[0] if self._profiles else None)
         if not profile: return "无可用模型"
+        if model_spec:                                   # 本次显式换了模型 → 更新会话
+            sess.model_tag = profile.label or str(profile.group)
         meta = build_meta(sess.duration, sess.total_frames, len(sess.grids_base64),
                           sess.scene_count, sess.timestamps)
         ctx = f"之前: {sess.analysis[:500]}\n\n追问: {question}\n\n基于帧回答指出时间。"
