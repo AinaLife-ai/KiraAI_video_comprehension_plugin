@@ -40,7 +40,7 @@ class ModelProfile:
     """单组模型配置"""
     __slots__ = (
         "enabled", "group", "name", "api_base", "api_key",
-        "mode", "priority", "max_video_sec", "label",
+        "mode", "priority", "max_video_sec", "label", "native_audio",
         "extra_headers", "extra_body",
     )
 
@@ -48,6 +48,7 @@ class ModelProfile:
                  api_base: str | None, api_key: str,
                  mode: str, priority: int, max_video_sec: int,
                  label: str = "",
+                 native_audio: bool = False,
                  extra_headers: dict | None = None,
                  extra_body: dict | None = None):
         self.enabled = enabled
@@ -59,6 +60,8 @@ class ModelProfile:
         self.priority = priority
         self.max_video_sec = max_video_sec
         self.label = (label or "").strip()   # 别名，供 bot 按名字指定（如 "Agnes"）
+        # 该组模型是否自带音视频理解（能自己"听"）→ 决定要不要跑 ASR 转写
+        self.native_audio = bool(native_audio)
         # 附加到每次请求的自定义头/体（OpenAI SDK 的 extra_headers / extra_body）
         self.extra_headers = extra_headers or {}
         self.extra_body = extra_body or {}
@@ -87,6 +90,7 @@ class ModelProfile:
             priority=int(sec.get(f"priority_{group}", 9)),
             max_video_sec=int(sec.get(f"max_video_sec_{group}", 600)),
             label=str(sec.get(f"label_{group}", "") or ""),
+            native_audio=bool(sec.get(f"native_audio_{group}", False)),
             extra_headers=_as_dict(sec.get(f"extra_headers_{group}")),
             extra_body=_as_dict(sec.get(f"extra_body_{group}")),
         )
@@ -129,6 +133,58 @@ def _fts(s: float) -> str:
     return f"{m:02d}:{s - m * 60:06.3f}"
 
 
+async def analyze_gemini_native(profile: "ModelProfile", video_path: str,
+                                 question: str, default_prompt: str) -> str:
+    """Gemini **原生** generateContent（inline_data 传视频）。
+
+    Gemini 的 OpenAI 兼容层不支持 video_url，但原生 API 支持把视频/音频
+    直接内联进来（音视频一起理解）。这里用 Gemini 原生格式调用。
+
+    受 Gemini inline 请求上限约束（约 20MB，base64 后算），超了会抛错，
+    由上层自动降级到帧模式。
+    """
+    import base64, os, httpx
+    size_mb = os.path.getsize(video_path) / (1024 * 1024)
+    if size_mb > NATIVE_MAX_MB:
+        raise RuntimeError(
+            f"视频 {size_mb:.1f}MB 超过 Gemini 内联上限 {NATIVE_MAX_MB}MB，已改用帧模式"
+        )
+    with open(video_path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode("utf-8")
+
+    base = (profile.api_base or "https://generativelanguage.googleapis.com/v1beta").rstrip("/")
+    # 用户可能填的是 .../v1beta/openai（OpenAI 兼容端点）→ 归一化回原生路径
+    if base.endswith("/openai"):
+        base = base[: -len("/openai")]
+    if "/v1beta" not in base and "/v1" not in base:
+        base = base + "/v1beta"
+    url = f"{base}/models/{profile.name}:generateContent"
+
+    payload = {
+        "contents": [{
+            "role": "user",
+            "parts": [
+                {"inline_data": {"mime_type": "video/mp4", "data": b64}},
+                {"text": f"{default_prompt}\n\n{question}"},
+            ],
+        }],
+    }
+    headers = {"x-goog-api-key": profile.api_key,
+               "Content-Type": "application/json"}
+    headers.update(profile.extra_headers or {})
+
+    async with httpx.AsyncClient(timeout=300) as c:
+        r = await c.post(url, json={**payload, **(profile.extra_body or {})}, headers=headers)
+    if r.status_code != 200:
+        raise RuntimeError(f"Gemini 原生调用失败 HTTP {r.status_code}: {r.text[:200]}")
+    d = r.json()
+    try:
+        parts = d["candidates"][0]["content"]["parts"]
+        return "".join(p.get("text", "") for p in parts) or "(无回复)"
+    except Exception:
+        raise RuntimeError(f"Gemini 返回格式异常: {str(d)[:200]}")
+
+
 async def analyze_frames(profile: ModelProfile, grids: list[str],
                           meta: str, question: str, default_prompt: str) -> str:
     client = AsyncOpenAI(api_key=profile.api_key, base_url=profile.api_base)
@@ -164,11 +220,12 @@ async def analyze_native(profile: ModelProfile, video_path: str,
             f"不允许走原生视频调用（应走拼图帧模式）"
         )
     base = (profile.api_base or "").lower()
-    # Gemini 的 OpenAI 兼容层只有 image_url/audio，没有 video_url（官方文档「图片理解/音频理解」）
+    # Gemini：它的 OpenAI 兼容层没有 video_url（官方文档只有「图片理解/音频理解」），
+    # 所以这里自动改走 Gemini **原生 API**（generateContent + inline_data），
+    # 那条路既支持视频也支持音频 —— 配合 native_audio 开关就能一步到位。
     if "generativelanguage.googleapis.com" in base:
-        raise RuntimeError(
-            "Gemini OpenAI 兼容层不支持 video_url，请把该模型组的模式改为 frames（或用原生 Gemini API）"
-        )
+        return await analyze_gemini_native(profile, video_path, question,
+                                           default_prompt)
     if video_url:
         url = video_url
     else:

@@ -104,6 +104,17 @@
         "default": 20,
         "hint": "自动缓存收到的视频时，超过此大小就中止下载（边下边检测）。防止有人发超大文件把磁盘写满。0 = 不限制"
       },
+      "cache_scope": {
+        "type": "string",
+        "options": [
+          "mentioned",
+          "batch",
+          "all"
+        ],
+        "default": "mentioned",
+        "name": "缓存范围",
+        "hint": "mentioned=只缓存被@/引用/唤醒的视频(默认,最省)；batch=缓存所有进入bot批次的视频；all=群里所有视频都缓存(最耗)。注意：不影响bot主动调 analyze_video 分析视频——工具调用任何时候都能用"
+      },
       "cache_ttl_hours": {
         "type": "integer",
         "name": "缓存保留时长(小时)",
@@ -149,6 +160,12 @@
         "default": "native",
         "hint": "native=传视频URL给模型；frames=本地抽帧拼图后传图片"
       },
+      "native_audio_1": {
+        "type": "switch",
+        "name": "模型自带音视频理解(跳过语音识别)",
+        "default": false,
+        "hint": "本组模型只能看到画面帧、**听不到音频**，所以默认关闭 —— 保持关闭，让插件用 ASR 转写把「说了什么」补给它。⚠️ 若开启，会连转写文字都没有，**声音信息彻底丢失、效果反而更差**。（除非你确认本组模型确实自带音视频理解）"
+      },
       "api_base_1": {
         "type": "string",
         "name": "API 地址",
@@ -188,7 +205,7 @@
   },
   "section_model_2": {
     "type": "section",
-    "name": "📦 模型组 2（Qwen3-VL 推荐）",
+    "name": "📦 模型组 2（MiMo 全模态 推荐）",
     "collapsed": false,
     "fields": {
       "enabled_2": {
@@ -199,7 +216,8 @@
       "model_name_2": {
         "type": "string",
         "name": "模型名称",
-        "default": "qwen3.8-max"
+        "default": "mimo-v2.5",
+        "hint": "小米 MiMo 全模态模型（原生理解图像/视频/音频/文本，1M 上下文）"
       },
       "label_2": {
         "type": "string",
@@ -216,10 +234,16 @@
         ],
         "default": "native"
       },
+      "native_audio_2": {
+        "type": "switch",
+        "name": "模型自带音视频理解(跳过语音识别)",
+        "default": true,
+        "hint": "开启后，bot 用本组分析视频时**跳过语音识别（ASR）转写** —— 本组模型自带音视频理解，能自己「听」。使用本组可无需额外语音识别，如只用本组可直接关闭语音识别选项。（注意：B站字幕是文字不是音频，不受此开关影响，仍然会用）"
+      },
       "api_base_2": {
         "type": "string",
         "name": "API 地址",
-        "default": "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        "default": "https://api.xiaomimimo.com/v1"
       },
       "api_key_2": {
         "type": "sensitive",
@@ -252,7 +276,7 @@
   },
   "section_model_3": {
     "type": "section",
-    "name": "📦 模型组 3（Gemini 2.5 推荐）",
+    "name": "📦 模型组 3（Gemini 原生 推荐 frames）",
     "collapsed": true,
     "fields": {
       "enabled_3": {
@@ -278,12 +302,20 @@
           "native",
           "frames"
         ],
-        "default": "native"
+        "default": "native",
+        "hint": "native = 走 Gemini **原生 API**（generateContent + inline_data，音视频一起理解）；frames = 传拼图（更省，且兼容性最好）"
+      },
+      "native_audio_3": {
+        "type": "switch",
+        "name": "模型自带音视频理解(跳过语音识别)",
+        "default": true,
+        "hint": "开启后，bot 用本组分析视频时**跳过语音识别（ASR）转写** —— 本组模型自带音视频理解，能自己「听」。使用本组可无需额外语音识别，如只用本组可直接关闭语音识别选项。（注意：B站字幕是文字不是音频，不受此开关影响，仍然会用）"
       },
       "api_base_3": {
         "type": "string",
         "name": "API 地址",
-        "default": "https://generativelanguage.googleapis.com/v1beta/openai"
+        "default": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "hint": "填 https://generativelanguage.googleapis.com/v1beta 即可（插件会自动走原生 API）；填带 /openai 的兼容端点也能用，会自动归一化"
       },
       "api_key_3": {
         "type": "sensitive",
@@ -343,6 +375,12 @@
           "native"
         ],
         "default": "frames"
+      },
+      "native_audio_4": {
+        "type": "switch",
+        "name": "模型自带音视频理解(跳过语音识别)",
+        "default": false,
+        "hint": "本组模型只能看到画面帧、**听不到音频**，所以默认关闭 —— 保持关闭，让插件用 ASR 转写把「说了什么」补给它。⚠️ 若开启，会连转写文字都没有，**声音信息彻底丢失、效果反而更差**。（除非你确认本组模型确实自带音视频理解）"
       },
       "api_base_4": {
         "type": "string",
@@ -497,6 +535,12 @@
         "default": "low",
         "hint": "low=360p，medium=720p，original=原画。下载时直接选对应档位，不下原画再压"
       },
+      "bili_direct_url": {
+        "type": "switch",
+        "name": "B站视频直链直传(免上传)",
+        "default": true,
+        "hint": "开启后，B站视频做 native 分析时直接用B站的 html5 MP4 直链交给模型，省掉一次上传。注意：能否成功取决于模型服务端拉流用的 User-Agent（空UA/python-requests 会被B站拦），试不通就关掉它回退上传"
+      },
       "bili_compress_quality": {
         "type": "string",
         "name": "B站压缩质量(下载后再压)",
@@ -642,8 +686,8 @@
       "audio_wait_sec": {
         "type": "integer",
         "name": "分析时最多等待(秒)",
-        "default": 30,
-        "hint": "转写通常在收到视频时就已在后台跑。分析时最多等这么久，超时就不带转写继续（绝不卡住分析）。调大＝更容易吃到转写，代价是分析可能多等一会儿；转写结果会落盘缓存，这次没等到、下次追问仍能用上"
+        "default": 60,
+        "hint": "转写通常在收到视频时就已在后台跑。分析时最多等这么久，超时就不带转写继续（绝不卡住分析）。默认 60 秒 —— 给长视频留余量（实测 5 分 52 秒的视频转写约 25 秒，但网络/服务慢时会更久）。转写结果会落盘缓存，这次没等到、下次追问仍能用上"
       },
       "audio_max_sec": {
         "type": "integer",
