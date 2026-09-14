@@ -524,6 +524,12 @@
         "default": false,
         "hint": "开启后检测到消息中的B站链接/BV号，自动下载压缩视频并发送到群/私聊，不消耗token"
       },
+      "auto_send_dry_run": {
+        "type": "switch",
+        "name": "【诊断】只检测不发送",
+        "default": false,
+        "hint": "排查用：开启后自动钩子只会检测并打印日志（[VCDIAG]），不会真的去下载/发送视频。用于定位问题出在检测阶段还是发送阶段。排查完请关掉"
+      },
       "napcat_stream_upload": {
         "type": "switch",
         "name": "大文件分块上传(仅 NapCat 扩展)",

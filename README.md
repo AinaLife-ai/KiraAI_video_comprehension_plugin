@@ -406,7 +406,7 @@ analyze_video(session_id="abc123", segments=[[10,30],[100,130]])   # 一次多�
 | 智谱 GLM | 官方示例为 **URL** 形式 | `native` 或 `frames` | 官方文档仅演示公网 URL；base64 视频未在文档中保证，失败会自动降级 `frames` |
 | 阿里 Qwen (百炼) | ✅ 支持，另有 `fps` 参数 | `native` | 本地文件支持 Base64 上传 |
 | 小米 **MiMo** | ✅ 支持（URL + base64 ≤50MB） | `native` | **原生理解图像/视频/音频/文本**，1M 上下文；接口 OpenAI 兼容，可直接配进模型组 |
-| Google **Gemini** | ✅ **原生 API 支持**（本插件自动改走 `generateContent`）| `native` | 走原生 API 时**音视频一起理解**；base64 内联受 20MB 限制，超了自动回退帧模式 |
+| Google **Gemini** | ❌ **不支持 video_url**（官方只认 Files API 上传 / base64 内联 / YouTube 网址）| `frames`，或 `native`+**官方端点** | 填**官方端点** `generativelanguage.googleapis.com` 时本插件会走原生 API（`inline_data` 内联，等于"上传"）；填**第三方中转**时会明确失败并降级帧模式 —— **传 URL 会被静默忽略，模型会回答「没看到视频」** |
 | 其他 OpenAI 兼容 | 视厂商而定 | `frames` 最稳 | `native` 失败会自动降级 |
 
 **自动降级**：`native` 模式请求失败（厂商不支持 / 视频超过 20MB / 请求体过大）时，自动改用拼图帧模式重试，并在结果中标注 `native→frames`。
@@ -479,6 +479,8 @@ analyze_video(session_id="abc123", segments=[[10,30],[100,130]])   # 一次多�
 <details>
 <summary><b>📜 更新日志</b>（点击展开，共 20+ 个版本）</summary>
 
+- 1.16.6 — **修复 Gemini 用 B站直链导致的「假成功」**：Gemini 官方支持的视频输入只有 **Files API 上传 / Cloud Storage / base64 内联（<100MB）/ YouTube 网址**，**不支持任意公开 HTTPS 视频链接**；而它的 OpenAI 兼容层连 `video_url` 字段都没有，传了会被**静默忽略** —— 表现为模型照常返回、却说「我没看到视频」。
+  现在：`api_base` 是**官方端点** → 走原生 API（`inline_data` 内联，即"上传"）；是**第三方中转**（含模型名带 `gemini` 的情况）→ **明确失败并降级到帧模式**，绝不假成功。另加 **`auto_send_dry_run`** 诊断开关（只检测不发送）+ 分阶段 `[VCDIAG]` 日志（**仅在开关打开时输出**，不刷屏）
 - 1.16.5 — 新增**自身消息防御**：bot 自己发的消息（如 `send_video` 发出去的B站链接）不再触发自动发送与视频缓存。原本靠两层外部默认值兜着（SnowLuma/NapCat 的 `reportSelfMessage` 默认 false、自身消息 `post_type=message_sent` 而框架只处理 `message`），现在插件自己再挡一道：`self_id == sender.user_id`、或 `raw_message.post_type == "message_sent"` 一律跳过。避免"自己刚发完又被钩子发一遍"的重复刷屏
 - 1.16.4 — 修复**「已自动发送」标注对短链 / 小程序卡片消息不生效**（三个叠加的问题）：① 定位原始消息时又只从 `Text` 元素取文本，卡片不是 `Text` 类型 → 扫不到；② 匹配用的是解析出的 `BV` 号，而消息里写的是 `b23.tv/xxxx` 短链 → **永远匹配不上**；③ 记录在校验**之前**就被 pop 走 → 一轮没匹配上就永久丢失。现在：记 **b23 短链 id** 一起匹配、用 `_collect_chain_text()` 扫整条链（含卡片字段）、优先按 **message_id** 精确定位、**匹配成功才消费**记录（超时 5 分钟才清理）。同版另做两项调整：**自动发送改为只认「明确的 B站链接」**（`bilibili.com/video/BV…` / `b23.tv/…`），**裸 BV 号不再触发**——裸号在聊天里容易误触发，假号还会换来 `-400` 报错；**自动钩子的失败/异常只写日志、不再发到会话里**（要看就去看 cmd 日志）；另对传入的 BV 号做**规范化**（去空白 / 从链接抠号 / 修 `bv` 前缀），并把 `-400` 翻译成可读原因
 - 1.16.3 — **默认不再使用 `upload_file_stream`**（NapCat 第三方扩展 action）：新增 `napcat_stream_upload` 开关，**默认关闭**，直接用本地路径发送（AstrBot 等同类软件的做法，NapCat / SnowLuma 都能读）。修复在部分协议端「发视频时 WebSocket 断开 / 程序退出」的问题。另**修复 B站小程序卡片（`com.tencent.miniapp_01` 等）不被识别**：原来只从 `Text` 元素取文本，卡片不是 `Text` 类型导致链接提取不到，现改为扫描整条消息链所有元素的字段（含 dict / list）

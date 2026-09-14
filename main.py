@@ -221,6 +221,8 @@ class VideoComprehensionPlugin(BasePlugin):
         self.bili_search_n = int(bs.get("bili_search_count", 5))
         self.bili_max_dl = int(bs.get("bili_max_download_sec", 600))
         self.auto_send_link = bs.get("auto_send_link", False)
+        # 诊断用：只检测不发送（用于定位"收到链接就崩"是检测阶段还是发送阶段）
+        self.auto_send_dry_run = bool(bs.get("auto_send_dry_run", False))
         # NapCat 的 upload_file_stream（第三方扩展 action，分块上传）—— 默认关闭。
         # 官方 NapCat 没有它，同类软件（AstrBot 等）也不用它；直接用本地路径发送
         # 对 NapCat / SnowLuma 都够用。开启后才尝试分块上传（失败仍会自动降级）。
@@ -647,7 +649,14 @@ class VideoComprehensionPlugin(BasePlugin):
         # 收集整条消息链里所有可能带链接的文本。
         # ⚠️ 不能只看 Text 元素：QQ 小程序卡片（com.tencent.miniapp_01）等
         #    元素不是 Text 类型，但它们的字段里带着 qqdocurl（B站短链）。
+        # ⚠️ 这两条在"每条消息"都会走到，所以**只在开诊断开关时才打**，
+        #    否则就是刷屏（和之前那个"未发现链接"的日志同一个坑）。
+        _diag = self.auto_send_dry_run
+        if _diag:
+            logger.info("[VCDIAG] 1/6 hook 进入 sid=%s", sid)
         text = _collect_chain_text(event.message.chain)
+        if _diag:
+            logger.info("[VCDIAG] 2/6 文本收集完成 len=%d", len(text))
 
         # ⚠️ 只认「**明确的 B站链接**」，**不再把裸 BV 号当触发条件**。
         #    原因：裸的 BV+10位字母数字在日常聊天里出现概率不低（很容易误触发），
@@ -706,15 +715,22 @@ class VideoComprehensionPlugin(BasePlugin):
         if m2:
             match_keys.append(m2.group(1))
         mid = self._msg_id(event)
+        logger.info("[VCDIAG] 3/6 检测到B站视频 bvid=%s keys=%s", bvid, match_keys)
         logger.info("[VC] auto_send 检测到B站视频: %s（匹配键=%s）", bvid, match_keys)
+        if self.auto_send_dry_run:
+            logger.info("[VCDIAG] dry_run=开 → 只检测不发送，到此为止")
+            return
         asyncio.create_task(self._auto_send_do(bvid, event.adapter.name, sid,
                                                match_keys=match_keys, message_id=mid))
+        logger.info("[VCDIAG] 4/6 后台任务已创建（hook 返回，不再占用消息处理）")
 
     async def _auto_send_do(self, bvid: str, adapter_name: str, sid: str,
                             match_keys: list | None = None, message_id: str = ""):
         """异步后台发送，成功后记录 auto_sent 用于 LLM 上下文标注"""
         try:
+            logger.info("[VCDIAG] 5/6 后台任务开始 bvid=%s sid=%s", bvid, sid)
             reply = await self._send_video_by_bvid(None, bvid, sid=sid, adapter_name=adapter_name)
+            logger.info("[VCDIAG] 6/6 发送函数返回: %s", str(reply)[:80])
             if reply and reply.startswith("✅"):
                 # 成功 → 记录 auto_sent，不 discard，消息继续自然流转
                 title = bvid
@@ -1470,8 +1486,10 @@ class VideoComprehensionPlugin(BasePlugin):
         """
         # BV 号规范化：bot 传进来的值可能带空格/换行，或整个链接。
         # 不处理的话会原样发给 B站 → 返回 code=-400（请求错误），报错很难懂。
+        logger.info("[VCDIAG] a) send_video 进入 raw=%r", bvid)
         _raw_bvid = str(bvid or "")
         bvid = self._normalize_bvid(_raw_bvid)
+        logger.info("[VCDIAG] b) bvid 规范化 -> %s", bvid)
         if not bvid:
             # 可能是 b23.tv 短链 / 带短链的分享文本 → 联网解析一次
             try:
@@ -1481,6 +1499,7 @@ class VideoComprehensionPlugin(BasePlugin):
         if not bvid:
             return ("⚠️ 没有解析出有效的 BV 号。请传 BV 号本身（形如 BV1xx411c7mD），"
                     "或完整的 B站视频链接 / b23.tv 短链。")
+        logger.info("[VCDIAG] c) 开始请求B站视频信息（网络）…")
         try: info = await get_bili_info(bvid, self.bili_cookie)
         except Exception as e:
             # 把 B站的 code 翻译成人话，方便用户判断是"视频没了"还是"参数不对"
@@ -1490,6 +1509,7 @@ class VideoComprehensionPlugin(BasePlugin):
                         f"通常是 BV 号无效或视频不存在（已删除/私密）。\n"
                         f"   BV: {bvid}\n   原始报错: {msg}")
             return f"⚠️ 获取信息失败：{msg}（BV: {bvid}）"
+        logger.info("[VCDIAG] d) 拿到视频信息 title=%r", info.get("title"))
         d = info.get("duration", 0); title = info.get("title", bvid)
         if self.bili_max_dl and d > self.bili_max_dl:
             return f"⏱ 「{title}」时长{d}s超上限，不下发"
