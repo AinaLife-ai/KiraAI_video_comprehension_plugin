@@ -529,6 +529,41 @@ class VideoComprehensionPlugin(BasePlugin):
     def _sid(self, event) -> str:
         return getattr(event.session, "sid", None) or getattr(event, "sid", "") or ""
 
+    @staticmethod
+    def _normalize_bvid(raw) -> str:
+        """把 bot 传来的值规范成 BV 号。
+
+        bot 可能传：`BV1xx411c7mD`、带空格的、完整的视频链接、或 b23 短链文本。
+        不规范化就原样发给 B站 → code=-400，报错很难懂。
+
+        ⚠️ BV 号**大小写敏感**（实测小写会返回 -404），所以只做以下处理：
+        去空白 / 从链接里抠出 BV 号 / 只把 `bv` 前缀转成大写（尾号保持原样）。
+        """
+        s = str(raw or "").strip()
+        if not s:
+            return ""
+        m = re.search(r"BV[0-9A-Za-z]{10}", s)
+        if m:
+            return m.group(0)          # 保留原始大小写
+        m2 = re.match(r"^bv([0-9A-Za-z]{10})$", s)
+        if m2:
+            return "BV" + m2.group(1)  # 只修前缀，尾号不猜
+        return ""
+
+    @staticmethod
+    def _msg_id(event) -> str:
+        """取消息 ID（用于在上下文里精确定位某条消息）。取不到就返回空串。"""
+        try:
+            for holder in (getattr(event, "message", None), event):
+                if holder is None:
+                    continue
+                v = getattr(holder, "message_id", None)
+                if v:
+                    return str(v)
+        except Exception:
+            pass
+        return ""
+
     def _is_qq(self, event) -> bool:
         """判断是否 QQ 平台（platform 来自适配器 manifest.name，内置为 "QQ"，大小写不敏感）"""
         return str(getattr(event.adapter, "platform", "") or "").strip().lower() == "qq"
@@ -577,46 +612,66 @@ class VideoComprehensionPlugin(BasePlugin):
         #    元素不是 Text 类型，但它们的字段里带着 qqdocurl（B站短链）。
         text = _collect_chain_text(event.message.chain)
 
-        # 1) 精确搜 BV 号（BVID_RE 就是 BV[0-9A-Za-z]{10}，不会脏匹配）
-        m = BVID_RE.search(text)
+        # ⚠️ 只认「**明确的 B站链接**」，**不再把裸 BV 号当触发条件**。
+        #    原因：裸的 BV+10位字母数字在日常聊天里出现概率不低（很容易误触发），
+        #    而且如果是假号，会先走 B站接口、拿回 code=-400 再报错 —— 用户明确
+        #    要求不要这样自动发。要发裸 BV 号请让 bot 主动调 send_video。
+        m = re.search(r'https?://(?:www\.|m\.)?bilibili\.com/video/(BV[0-9A-Za-z]{10})',
+                      text, re.I)
         if m:
-            bvid = m.group(0)
+            bvid = m.group(1)
 
-        # 2) 没有 BV 号但有 b23 短链 → 解析成 BV 号
+        # b23 短链（也必须是带协议的完整短链）
         if not bvid:
-            m = re.search(r'b23\.tv/([0-9A-Za-z]+)', text)
-            if m:
-                try: bvid = await extract_bvid(f"https://b23.tv/{m.group(1)}", self.dl_timeout)
+            m2 = re.search(r'https?://b23\.tv/([0-9A-Za-z]+)', text)
+            if m2:
+                try:
+                    bvid = await extract_bvid(m2.group(0), self.dl_timeout)
                 except Exception:
-                    logger.info("[VC] b23 短链解析失败: %s", m.group(1))
-
-        # 3) raw_message JSON（小程序卡片/app分享的 qqdocurl 里藏 b23）
-        if not bvid:
-            import json as _json
-            raw = getattr(event, "raw_message", None)
-            if raw is None and hasattr(event, "message"):
-                raw = getattr(event.message, "raw_message", None)
-            if raw is None and hasattr(event, "message") and hasattr(event.message, "source_message"):
-                raw = getattr(event.message, "source_message", None)
-            if raw is None:
-                raw = str(event)
-            if isinstance(raw, dict):
-                try: raw = _json.dumps(raw)
-                except: raw = ""
-            if isinstance(raw, str):
-                m = re.search(r'https?://b23\.tv/[0-9A-Za-z]+', raw)
-                if m:
-                    try: bvid = await extract_bvid(m.group(0), self.dl_timeout)
-                    except: pass
+                    logger.info("[VC] b23 短链解析失败: %s", m2.group(1))
                 if not bvid:
-                    m = re.search(r'BV[0-9A-Za-z]{10}', raw)
-                    if m: bvid = m.group(0)
+                    logger.info("[VC] b23 短链未解析出 BV 号，跳过自动发送: %s", m2.group(0))
 
-        if not bvid: return
-        logger.info("[VC] auto_send 检测到B站视频: %s", bvid)
-        asyncio.create_task(self._auto_send_do(bvid, event.adapter.name, sid))
+        # 兜底：如果链文本里没有，再从 raw_message 里找一次（有些适配器
+        # 把卡片原文放在别处）
+        if not bvid:
+            try:
+                import json as _json
+                raw = getattr(event, "raw_message", None)
+                if raw is None and hasattr(event, "message"):
+                    raw = getattr(event.message, "raw_message", None)
+                if raw is None and hasattr(event, "message") and hasattr(event.message, "source_message"):
+                    raw = getattr(event.message, "source_message", None)
+                if isinstance(raw, dict):
+                    raw = _json.dumps(raw, ensure_ascii=False)
+                if isinstance(raw, str) and raw:
+                    m3 = re.search(r'https?://b23\.tv/([0-9A-Za-z]+)', raw)
+                    if m3:
+                        bvid = await extract_bvid(m3.group(0), self.dl_timeout)
+                    if not bvid:
+                        m4 = re.search(r'https?://(?:www\.|m\.)?bilibili\.com/video/(BV[0-9A-Za-z]{10})', raw, re.I)
+                        if m4:
+                            bvid = m4.group(1)
+            except Exception:
+                pass
 
-    async def _auto_send_do(self, bvid: str, adapter_name: str, sid: str):
+        if not bvid:
+            logger.info("[VC] auto_send 未发现「明确的 B站链接」，跳过（裸 BV 号不触发）")
+            return
+        # 记录"用来在上下文里定位这条消息"的匹配键。
+        # ⚠️ 不能只用 bvid：消息里写的可能是 b23 短链（V5Xhy88 这种），
+        #    或藏在 QQ 小程序卡片的 qqdocurl 里，用 BV 号是匹配不上的。
+        match_keys = [bvid]
+        m2 = re.search(r'b23\.tv/([0-9A-Za-z]+)', text)
+        if m2:
+            match_keys.append(m2.group(1))
+        mid = self._msg_id(event)
+        logger.info("[VC] auto_send 检测到B站视频: %s（匹配键=%s）", bvid, match_keys)
+        asyncio.create_task(self._auto_send_do(bvid, event.adapter.name, sid,
+                                               match_keys=match_keys, message_id=mid))
+
+    async def _auto_send_do(self, bvid: str, adapter_name: str, sid: str,
+                            match_keys: list | None = None, message_id: str = ""):
         """异步后台发送，成功后记录 auto_sent 用于 LLM 上下文标注"""
         try:
             reply = await self._send_video_by_bvid(None, bvid, sid=sid, adapter_name=adapter_name)
@@ -630,15 +685,18 @@ class VideoComprehensionPlugin(BasePlugin):
                     "bvid": bvid,
                     "title": title,
                     "file_path": reply.split("本地路径:")[-1].strip() if "本地路径:" in reply else "",
+                    # 用于在 LLM 上下文里定位原始消息（短链/卡片消息不能靠 bvid 匹配）
+                    "match_keys": list(match_keys or [bvid]),
+                    "message_id": str(message_id or ""),
+                    "ts": time.time(),
                 }
             elif reply:
-                # 失败 → 补发文字提示
-                await self.ctx.message_processor.send_message_chain(
-                    sid, MessageChain([Text(reply)]))
+                # 失败 → **只记日志，不发到会话里**（自动钩子是后台行为，
+                # 报错刷屏会打扰群聊；要看就去 cmd / 日志里看）
+                logger.warning("[VC] auto_send 未成功: %s", reply)
         except Exception as e:
-            logger.warning("[VC] auto_send 失败: %s", e)
-            try: await self.ctx.message_processor.send_message_chain(sid, MessageChain([Text(f"❌ 发送B站视频失败: {e}")]))
-            except: pass
+            # 同上：异常也只落日志，不往会话里发消息
+            logger.warning("[VC] auto_send 异常: %s", e)
 
     # ── 批次阶段缓存（避免群里与 bot 无关的视频也被下载+转写） ──
 
@@ -680,13 +738,23 @@ class VideoComprehensionPlugin(BasePlugin):
         if not self.enabled: return
         sid = getattr(event.session, "sid", None)
         if not sid: return
-        sent = self._auto_sent.pop(sid, None)
+        # ⚠️ 这里**不能**先 pop：万一这一轮没匹配到（比如消息还没进批次），
+        #    记录就被永久丢掉了。匹配成功后再删；超时（5 分钟）才丢弃。
+        sent = self._auto_sent.get(sid)
         if not sent: return
+        if time.time() - float(sent.get("ts") or 0) > 300:
+            self._auto_sent.pop(sid, None)
+            return
         note = (
             f"\n[系统提示：该B站视频（《{sent['title']}》"
             f"BV:{sent['bvid']}）已自动发送压缩版视频（{sent.get('file_path','')}）]"
         )
         bvid = sent["bvid"]
+        # 匹配键：bvid + b23 短链 id（消息里写的可能是短链或藏在卡片里）
+        keys = [k for k in (sent.get("match_keys") or []) if k]
+        if bvid not in keys:
+            keys.append(bvid)
+        want_mid = str(sent.get("message_id") or "")
         # 按顺序遍历 messages ↔ user_prompt，定位原始消息追加 note
         prompt_idx = 0
         for msg in event.messages:
@@ -699,9 +767,17 @@ class VideoComprehensionPlugin(BasePlugin):
                 break
             p = req.user_prompt[prompt_idx]
             prompt_idx += 1
-            msg_text = "".join(e.text for e in msg.chain if isinstance(e, Text))
-            if bvid in msg_text:
+            # ① 消息 ID 精确匹配（最可靠）
+            hit = bool(want_mid) and want_mid == self._msg_id(msg)
+            # ② 回退：扫描整条消息链的文本（**不只 Text 元素**，
+            #    这样 QQ 小程序卡片里的 qqdocurl 也能被扫到）
+            if not hit:
+                msg_text = _collect_chain_text(getattr(msg, "chain", None))
+                hit = any(k in msg_text for k in keys)
+            if hit:
                 p.content += note
+                self._auto_sent.pop(sid, None)   # 标注成功 → 消费掉
+                logger.info("[VC] 已在上下文里标注「已自动发送」: %s", bvid)
                 break
 
     # ── 改写消息里的视频占位（让 bot 拿到可用的路径，而不是"没缓存"） ──
@@ -1348,8 +1424,28 @@ class VideoComprehensionPlugin(BasePlugin):
         """发送B站视频到QQ（内置 NapCat 分块上传防断连）
         event 可为 None（auto_send 钩子 discard 后用 adapter_name 参数代替）
         """
+        # BV 号规范化：bot 传进来的值可能带空格/换行，或整个链接。
+        # 不处理的话会原样发给 B站 → 返回 code=-400（请求错误），报错很难懂。
+        _raw_bvid = str(bvid or "")
+        bvid = self._normalize_bvid(_raw_bvid)
+        if not bvid:
+            # 可能是 b23.tv 短链 / 带短链的分享文本 → 联网解析一次
+            try:
+                bvid = await extract_bvid(_raw_bvid, self.dl_timeout)
+            except Exception:
+                bvid = ""
+        if not bvid:
+            return ("⚠️ 没有解析出有效的 BV 号。请传 BV 号本身（形如 BV1xx411c7mD），"
+                    "或完整的 B站视频链接 / b23.tv 短链。")
         try: info = await get_bili_info(bvid, self.bili_cookie)
-        except Exception as e: return f"⚠️ 获取信息失败：{e}"
+        except Exception as e:
+            # 把 B站的 code 翻译成人话，方便用户判断是"视频没了"还是"参数不对"
+            msg = str(e)
+            if "-400" in msg:
+                return (f"⚠️ 获取信息失败：B站返回「请求错误」。"
+                        f"通常是 BV 号无效或视频不存在（已删除/私密）。\n"
+                        f"   BV: {bvid}\n   原始报错: {msg}")
+            return f"⚠️ 获取信息失败：{msg}（BV: {bvid}）"
         d = info.get("duration", 0); title = info.get("title", bvid)
         if self.bili_max_dl and d > self.bili_max_dl:
             return f"⏱ 「{title}」时长{d}s超上限，不下发"
