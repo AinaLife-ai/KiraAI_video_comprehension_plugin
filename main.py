@@ -1452,12 +1452,20 @@ class VideoComprehensionPlugin(BasePlugin):
             try:
                 ad = self.ctx.adapter_mgr.get_adapter(event.adapter.name)
                 cl = ad.get_client()
+                # 同 _send_video_by_bvid：框架默认 10 秒超时对"发视频"远远不够
+                _send_to = 180
                 if "gm:" in sid:
-                    await cl.send_action("send_group_msg", {"group_id": int(sid.split(":")[-1]), "message": [{"type": "video", "data": {"file": out_path}}]})
+                    await cl.send_action("send_group_msg", {"group_id": int(sid.split(":")[-1]), "message": [{"type": "video", "data": {"file": out_path}}]}, timeout=_send_to)
                 elif "dm:" in sid:
-                    await cl.send_action("send_private_msg", {"user_id": int(sid.split(":")[-1]), "message": [{"type": "video", "data": {"file": out_path}}]})
+                    await cl.send_action("send_private_msg", {"user_id": int(sid.split(":")[-1]), "message": [{"type": "video", "data": {"file": out_path}}]}, timeout=_send_to)
                 else: return "无法判断群聊/私聊"
-            except Exception as e: return f"⚠️ 发送失败：{e}"
+            except Exception as e:
+                msg = str(e)
+                if "超时" in msg or "timeout" in msg.lower():
+                    return ("⚠️ 发送超时（视频可能仍在发送中）：协议端上传视频较慢，"
+                            "**请不要重发** —— 重发会导致群里出现多条相同视频。\n"
+                            f"   原始错误: {msg}")
+                return f"⚠️ 发送失败：{msg}"
             return f"✅ 已发送本地视频：{Path(lp).name} | 质量: {q}"
         if bvid:
             bv = bvid.strip()
@@ -1593,18 +1601,30 @@ class VideoComprehensionPlugin(BasePlugin):
                     logger.info("[VC] stream 上传不可用，降级直接发路径: %s", e)
 
             # 发送视频（file_ref 是 NapCat 引用路径或本地路径）
+            # ⚠️ 必须显式给足超时：框架 send_action 默认只有 10 秒，而协议端
+            #    发视频要走 highway 上传（把整个视频读进内存再传），10 秒常常
+            #    不够 —— 一旦超时，上层的"失败"会让 bot 重发，群里就会出现
+            #    多条相同视频；协议端也可能因此状态混乱（曾导致 ws 断开/退出）。
+            _send_to = 180
             if is_group:
                 await cl.send_action("send_group_msg", {
                     "group_id": target_id,
                     "message": [{"type": "video", "data": {"file": file_ref, "name": f"{bvid}.mp4"}}],
-                })
+                }, timeout=_send_to)
             else:
                 await cl.send_action("send_private_msg", {
                     "user_id": target_id,
                     "message": [{"type": "video", "data": {"file": file_ref, "name": f"{bvid}.mp4"}}],
-                })
+                }, timeout=_send_to)
         except Exception as e:
-            return f"⚠️ 发送失败：{e}"
+            msg = str(e)
+            # 超时 ≠ 发送失败：协议端很可能**还在上传**。这时必须明确提示
+            # bot 不要重发，否则群里会重复出现同一个视频。
+            if "超时" in msg or "timeout" in msg.lower():
+                return ("⚠️ 发送超时（视频可能仍在发送中）：协议端上传视频较慢，"
+                        "**请不要重发** —— 重发会导致群里出现多条相同视频。\n"
+                        f"   原始错误: {msg}")
+            return f"⚠️ 发送失败：{msg}"
         return f"✅ 已发送：{title}\nBV: {bvid} | ⏱ {d//60}:{d%60:02d} | 质量: {q}\n📁 本地路径: {out_path}"
     # ────────────── 工具3：analyze_video（分析开关控制） ──────────────
 
