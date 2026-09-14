@@ -104,6 +104,17 @@
         "default": 20,
         "hint": "自动缓存收到的视频时，超过此大小就中止下载（边下边检测）。防止有人发超大文件把磁盘写满。0 = 不限制"
       },
+      "cache_scope": {
+        "type": "string",
+        "options": [
+          "mentioned",
+          "batch",
+          "all"
+        ],
+        "default": "mentioned",
+        "name": "缓存范围",
+        "hint": "mentioned=只缓存被@/引用/唤醒的视频(默认,最省)；batch=缓存所有进入bot批次的视频；all=群里所有视频都缓存(最耗)。注意：不影响bot主动调 analyze_video 分析视频——工具调用任何时候都能用"
+      },
       "cache_ttl_hours": {
         "type": "integer",
         "name": "缓存保留时长(小时)",

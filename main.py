@@ -112,7 +112,8 @@ class VideoComprehensionPlugin(BasePlugin):
         self._ffmpeg_ok = False
         self._stream_unsupported = False
         self._upload_cache: dict[str, str] = {}   # 本地路径 → 已上传的公开 URL
-        self._cached_videos: dict[str, dict] = {}  # sid → 已缓存到本地、待告知 bot 的视频
+        self._cached_videos: dict[str, list] = {}   # sid → [{orig_name, path, rel, size_mb, ts}, ...]
+        self._video_failures: dict[str, dict] = {}  # sid → {原文件名: 失败原因}（供消息改写）
         self._asr_tasks: dict[str, asyncio.Task] = {}   # 转写缓存 key → 进行中的任务
         self._load_cfg(cfg)
 
@@ -211,6 +212,9 @@ class VideoComprehensionPlugin(BasePlugin):
         self.bili_use_subtitle = bool(au.get("bili_use_subtitle", True))
         self.audio_extra_headers = _as_dict(au.get("audio_stt_extra_headers"))
         self.audio_extra_body = _as_dict(au.get("audio_stt_extra_body"))
+        self.cache_scope = str(cs.get("cache_scope", "mentioned") or "mentioned").strip().lower()
+        if self.cache_scope not in ("mentioned", "batch", "all"):
+            self.cache_scope = "mentioned"
         self.audio_max_blocks = int(au.get("audio_max_blocks", 80) or 80)
         self.audio_concurrency = max(1, min(16, int(au.get("audio_concurrency", 5) or 5)))
         self.audio_silence_db = float(au.get("audio_silence_db", -35) or -35)
@@ -358,6 +362,7 @@ class VideoComprehensionPlugin(BasePlugin):
             except asyncio.CancelledError: pass
         self._pending.clear(); self._sessions.clear(); self._sid_sessions.clear()
         self._cached_videos.clear()
+        self._video_failures.clear()
         for t in list(self._asr_tasks.values()):
             if not t.done():
                 t.cancel()
@@ -463,8 +468,8 @@ class VideoComprehensionPlugin(BasePlugin):
             self._sid_sessions = {k: v for k, v in self._sid_sessions.items() if v}
             # 未被告知 bot 的缓存记录（30 分钟未用则丢弃）
             _now = time.time()
-            self._cached_videos = {k: v for k, v in self._cached_videos.items()
-                                   if _now - v.get("ts", 0) < 1800}
+            self._cached_videos = {k: [c for c in v if _now - c.get("ts", 0) < 1800]
+                                   for k, v in self._cached_videos.items() if v}
 
     def _sid(self, event) -> str:
         return getattr(event.session, "sid", None) or getattr(event, "sid", "") or ""
@@ -575,6 +580,39 @@ class VideoComprehensionPlugin(BasePlugin):
             try: await self.ctx.message_processor.send_message_chain(sid, MessageChain([Text(f"❌ 发送B站视频失败: {e}")]))
             except: pass
 
+    # ── 批次阶段缓存（避免群里与 bot 无关的视频也被下载+转写） ──
+
+    @on.im_batch_message(priority=Priority.LOW)
+    async def _on_batch_cache(self, event, *_):
+        """消息合并成批次（确定要送给 bot）后，才按 cache_scope 决定要不要缓存+转写。
+
+        - mentioned：只处理「被 @ / 引用 / 唤醒」的消息里的视频（默认，最省）
+        - batch    ：处理批次里所有消息的视频
+        - all      ：已在 _detect 阶段逐条缓存，这里不重复做
+
+        优先级 LOW：批次若被更早的插件 stop 掉，本钩子根本不会执行。
+        """
+        if not self.enabled or not self.auto_cache_video: return
+        if self.cache_scope == "all": return
+        if not self._ok(event): return
+        sid = self._sid(event)
+        if not sid: return
+        try:
+            msgs = list(getattr(event, "messages", None) or [])
+        except Exception:
+            return
+        if self.cache_scope == "mentioned":
+            msgs = [m for m in msgs if getattr(m, "is_mentioned", False)]
+        for m in msgs:
+            try:
+                for ele in self._iter_videos(getattr(m, "chain", None)):
+                    f = str(getattr(ele, "file", "") or "")
+                    if f.startswith(("http://", "https://")):
+                        nm = str(getattr(ele, "name", "") or "")
+                        asyncio.create_task(self._cache_then_transcribe(sid, f, nm))
+            except Exception:
+                continue
+
     # ── 已直发的 LLM 上下文标注（对齐音频条 inject_auto_sent_note） ──
 
     @on.llm_request(priority=Priority.LOW)
@@ -606,6 +644,55 @@ class VideoComprehensionPlugin(BasePlugin):
                 p.content += note
                 break
 
+    # ── 改写消息里的视频占位（让 bot 拿到可用的路径，而不是"没缓存"） ──
+
+    _VIDEO_PLACEHOLDER_RE = re.compile(
+        r"\[Video name:\s*([^\]\(]+?)\s*\(Video size over 10MB, not cached\)\]")
+
+    def _rewrite_video_notes(self, event, req, sid: str) -> None:
+        """把框架渲染的 `[Video name: X (Video size over 10MB, not cached)]`
+        替换成我们能提供的最佳信息：
+
+          - 已缓存     → [视频已缓存: <相对路径>]
+          - 缓存失败   → [视频未缓存: <原因>]
+          - 未预缓存   → [视频 X（未预缓存，可用 analyze_video 分析）]
+
+        最后一种很关键：即使因为缓存策略没提前下，也要让 bot 知道
+        「工具其实能处理」，而不是像以前那样回答"我看不到内容"。
+        """
+        cached = self._cached_videos.get(sid) or []
+        failed = self._video_failures.get(sid) or {}
+        if not cached and not failed and sid not in self._pending:
+            return
+        repl = {}
+        for c in cached:
+            n = str(c.get("orig_name") or "").strip().lower()
+            if n:
+                repl[n] = f"[视频已缓存: {c.get('rel','')}]"
+        for n, reason in failed.items():
+            repl.setdefault(n.lower(), f"[视频未缓存: {reason}]")
+
+        prompt_idx = 0
+        for msg in (getattr(event, "messages", None) or []):
+            while prompt_idx < len(req.user_prompt) and not (
+                    req.user_prompt[prompt_idx].name == "message"
+                    and req.user_prompt[prompt_idx].source == "system"):
+                prompt_idx += 1
+            if prompt_idx >= len(req.user_prompt):
+                break
+            p = req.user_prompt[prompt_idx]; prompt_idx += 1
+            if not isinstance(p.content, str) or "[Video name:" not in p.content:
+                continue
+
+            def _sub(m, _repl=repl):
+                name = (m.group(1) or "").strip()
+                hit = _repl.get(name.lower())
+                if hit:
+                    return hit
+                return f"[视频 {name}（未预缓存，可用 analyze_video 分析）]"
+
+            p.content = self._VIDEO_PLACEHOLDER_RE.sub(_sub, p.content)
+
     # ── Prompt ──
 
     @on.llm_request(priority=Priority.LOW)
@@ -614,21 +701,29 @@ class VideoComprehensionPlugin(BasePlugin):
         sid = self._sid(event)
         if not sid: return
         has_pending = sid in self._pending
-        cached = self._cached_videos.get(sid)
+        cached_list = self._cached_videos.get(sid) or []
         # pending 有时效：超过 10 分钟没被用掉就不再提示（避免每轮都刷）
         if has_pending:
             if time.time() - self._pending[sid].get("ts", 0) > 600:
                 self._pending.pop(sid, None)
                 has_pending = False
-        if not has_pending and not cached and not self._sid_sessions.get(sid): return
+        # ① 先把消息里框架写的「(Video size over 10MB, not cached)」改写成可用信息
+        #    （每条 prompt 都是当轮新渲染的，所以每轮都要改；改写内容会随消息进历史）
+        try:
+            self._rewrite_video_notes(event, req, sid)
+        except Exception as e:
+            logger.debug("[VC] 改写视频占位失败: %s", e)
+
+        if (not has_pending and not cached_list
+                and not self._sid_sessions.get(sid)
+                and not self._video_failures.get(sid)):
+            return
         hint = ""
-        if cached:
-            # 已缓存到本地 → 直接告诉 bot 路径，它就能拿去分析/引用/转发
-            rel = cached.get("rel", "")
-            hint = (f"\n【视频】《{cached.get('name','video.mp4')}》"
-                    f"({cached.get('size_mb', 0):.2f}MB) 已缓存到 {rel}"
-                    f"，可用 analyze_video(local_path=\"{rel}\") 分析其内容")
-            self._cached_videos.pop(sid, None)      # 只提示一次
+        if cached_list:
+            # 已缓存 → 在 system prompt 里给「怎么用」的提示（路径已在消息里）
+            first = cached_list[-1]
+            hint = (f"\n【视频】已缓存的视频用 analyze_video(local_path=\"{first.get('rel','')}\") "
+                    f"分析内容（画面 + 语音转写一起）")
         elif self.video_analysis_enabled and has_pending:
             url = self._pending[sid].get("url", "")
             if BILI_RE.search(url):
@@ -697,6 +792,44 @@ class VideoComprehensionPlugin(BasePlugin):
                 continue
         return ids
 
+    def _find_cached(self, safe_name: str) -> str:
+        """在缓存目录里找同一个原始文件名已缓存过的文件（避免同一视频反复下载）"""
+        try:
+            suffix = "_" + safe_name
+            for fn in os.listdir(self.other_cache_dir):
+                if fn.endswith(suffix) or fn == safe_name:
+                    p = os.path.join(self.other_cache_dir, fn)
+                    if os.path.isfile(p) and os.path.getsize(p) > 0:
+                        return p
+        except Exception:
+            pass
+        return ""
+
+    def _remember_cached(self, sid: str, safe_name: str, path: str):
+        """登记到该会话的已缓存列表（列表结构，支持一条消息里多个视频）"""
+        try:
+            rel = os.path.relpath(path, get_data_path()).replace("\\", "/")
+        except Exception:
+            rel = path
+        try:
+            size_mb = os.path.getsize(path) / (1024 * 1024)
+        except Exception:
+            size_mb = 0.0
+        lst = self._cached_videos.setdefault(sid, [])
+        for c in lst:
+            if c.get("path") == path:
+                c["ts"] = time.time()
+                return
+        lst.append({"orig_name": safe_name, "path": path, "rel": rel,
+                    "size_mb": size_mb, "ts": time.time()})
+
+    @staticmethod
+    def _explain_failure(e: Exception) -> str:
+        msg = str(e)
+        if "超过上限" in msg or type(e).__name__ == "DownloadTooLarge":
+            return "超过单文件大小上限"
+        return f"下载失败（{type(e).__name__}）"
+
     async def _cache_incoming_video(self, sid: str, url: str, name: str = "") -> str:
         """把收到的视频下载到本地缓存目录，供 bot 直接使用（返回本地路径）
 
@@ -708,22 +841,25 @@ class VideoComprehensionPlugin(BasePlugin):
             safe = re.sub(r"[^\w.\-]+", "_", (name or "").strip()) or "video.mp4"
             if not re.search(r"\.(mp4|mov|mkv|webm|avi|flv|m4v|ts|wmv)$", safe, re.I):
                 safe += ".mp4"
+            # 已有同名缓存 → 直接复用（同一视频常被反复引用，不必重复下载/转写）
+            existing = self._find_cached(safe)
+            if existing:
+                self._remember_cached(sid, safe, existing)
+                logger.info("[VC] 视频已在缓存中，复用: %s", os.path.basename(existing))
+                return existing
             path = os.path.join(self.other_cache_dir, f"v{int(time.time())}_{safe}")
             max_bytes = int(self.cache_max_file_mb * 1024 * 1024) if self.cache_max_file_mb > 0 else 0
             if not (os.path.exists(path) and os.path.getsize(path) > 0):
-                await download_video(url, path, timeout=self.dl_timeout, max_bytes=max_bytes)
-            if os.path.exists(path) and os.path.getsize(path) > 0:
                 try:
-                    rel = os.path.relpath(path, get_data_path())
-                except Exception:
-                    rel = path
-                rel = rel.replace("\\", "/")
-                size_mb = os.path.getsize(path) / (1024 * 1024)
-                self._cached_videos[sid] = {
-                    "path": path, "rel": rel, "name": safe,
-                    "size_mb": size_mb, "ts": time.time(),
-                }
-                logger.info("[VC] 视频已缓存(%d): %s (%.2fMB)", len(self._cached_videos), rel, size_mb)
+                    await download_video(url, path, timeout=self.dl_timeout, max_bytes=max_bytes)
+                except Exception as de:
+                    self._video_failures.setdefault(sid, {})[safe] = self._explain_failure(de)
+                    raise
+            if os.path.exists(path) and os.path.getsize(path) > 0:
+                self._remember_cached(sid, safe, path)
+                logger.info("[VC] 视频已缓存(%d): %s (%.2fMB)",
+                            len(self._cached_videos.get(sid) or []), os.path.basename(path),
+                            os.path.getsize(path) / (1024 * 1024))
                 return path
             logger.warning("[VC] 视频缓存后文件为空: %s", url)
         except Exception as e:
@@ -1023,19 +1159,17 @@ class VideoComprehensionPlugin(BasePlugin):
                 pass
         if url:
             self._pending[sid] = {"url": url, "source": "onebot", "ts": time.time()}
-            # 立即缓存到本地（供 bot 直接使用）；http(s) 才下载，本地路径直接用
+            # 缓存策略（cache_scope）：
+            #   all       → 每条消息就缓存（旧行为，最耗）
+            #   batch     → 等进入 bot 批次后再缓存
+            #   mentioned → 只在被 @ / 引用 / 唤醒时才缓存（默认，最省）
+            # 注意：URL 始终记录在 _pending，所以 bot 主动调工具时永远有源可用。
             if self.auto_cache_video:
                 if str(url).startswith(("http://", "https://")):
-                    asyncio.create_task(self._cache_then_transcribe(sid, url, vname))
+                    if self.cache_scope == "all":
+                        asyncio.create_task(self._cache_then_transcribe(sid, url, vname))
                 elif os.path.isfile(url):
-                    try:
-                        rel = os.path.relpath(url, get_data_path()).replace("\\", "/")
-                    except Exception:
-                        rel = url
-                    self._cached_videos[sid] = {
-                        "path": url, "rel": rel, "name": os.path.basename(url),
-                        "size_mb": os.path.getsize(url) / (1024 * 1024), "ts": time.time(),
-                    }
+                    self._remember_cached(sid, os.path.basename(url), url)
 
     # ────────────── 工具1：search_bili_video ──────────────
 
@@ -1317,14 +1451,22 @@ class VideoComprehensionPlugin(BasePlugin):
                 m = BVID_RE.search(source_url)
                 if m: bvid = m.group(0); source_type = "bilibili"
             else:
-                olds = self._list_sessions(sid)
-                if olds:
-                    cur = olds[0]
-                    if question: return await self._followup(cur, question, profile_spec)
-                    return (f"🔁 已有{len(olds)}个历史，最新session_id={cur.session_id}\n"
-                            f"🤖 {cur.analysis_model}\n{self._link_line(cur.host_url)}━━━\n"
-                            f"{cur.analysis[:300]}\n━━━\n追问用 session_id=\"{cur.session_id}\"")
-                return "当前无视频"
+                # 兜底：用该会话最近缓存的视频
+                # （插件 reload 后 _pending 会被清空，但缓存文件还在）
+                cached = self._cached_videos.get(sid) or []
+                if cached:
+                    latest = cached[-1]
+                    if os.path.isfile(latest.get("path", "")):
+                        source_url = latest["path"]; source_type = "local"
+                if not source_url:
+                    olds = self._list_sessions(sid)
+                    if olds:
+                        cur = olds[0]
+                        if question: return await self._followup(cur, question, profile_spec)
+                        return (f"🔁 已有{len(olds)}个历史，最新session_id={cur.session_id}\n"
+                                f"🤖 {cur.analysis_model}\n{self._link_line(cur.host_url)}━━━\n"
+                                f"{cur.analysis[:300]}\n━━━\n追问用 session_id=\"{cur.session_id}\"")
+                    return "当前无视频"
 
         sess_id = hashlib.md5(source_url.encode()).hexdigest()[:12]
         if sess_id in self._sessions:
