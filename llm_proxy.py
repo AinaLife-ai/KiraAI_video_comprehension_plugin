@@ -40,13 +40,14 @@ class ModelProfile:
     """单组模型配置"""
     __slots__ = (
         "enabled", "group", "name", "api_base", "api_key",
-        "mode", "priority", "max_video_sec",
+        "mode", "priority", "max_video_sec", "label",
         "extra_headers", "extra_body",
     )
 
     def __init__(self, group: int, enabled: bool, name: str,
                  api_base: str | None, api_key: str,
                  mode: str, priority: int, max_video_sec: int,
+                 label: str = "",
                  extra_headers: dict | None = None,
                  extra_body: dict | None = None):
         self.enabled = enabled
@@ -57,6 +58,7 @@ class ModelProfile:
         self.mode = mode
         self.priority = priority
         self.max_video_sec = max_video_sec
+        self.label = (label or "").strip()   # 别名，供 bot 按名字指定（如 "Agnes"）
         # 附加到每次请求的自定义头/体（OpenAI SDK 的 extra_headers / extra_body）
         self.extra_headers = extra_headers or {}
         self.extra_body = extra_body or {}
@@ -84,6 +86,7 @@ class ModelProfile:
             mode=sec.get(f"mode_{group}", "native"),
             priority=int(sec.get(f"priority_{group}", 9)),
             max_video_sec=int(sec.get(f"max_video_sec_{group}", 600)),
+            label=str(sec.get(f"label_{group}", "") or ""),
             extra_headers=_as_dict(sec.get(f"extra_headers_{group}")),
             extra_body=_as_dict(sec.get(f"extra_body_{group}")),
         )
@@ -152,6 +155,14 @@ async def analyze_native(profile: ModelProfile, video_path: str,
     否则把本地文件 base64 内联（受 NATIVE_MAX_MB 限制）。
     """
     import base64, os
+    # ⚠️ 硬约束：配置为 frames 的模型组**绝不能**走原生视频调用。
+    #    这类模型可能根本不支持 video_url（只吃 image_url），传了会失败或行为异常。
+    #    这里做防御性拦截 —— 即使将来某处调用点写错，也会立刻暴露而不是静默走错。
+    if profile.mode != "native":
+        raise RuntimeError(
+            f"模型组「{profile.label or profile.name}」配置的是 {profile.mode} 模式，"
+            f"不允许走原生视频调用（应走拼图帧模式）"
+        )
     base = (profile.api_base or "").lower()
     # Gemini 的 OpenAI 兼容层只有 image_url/audio，没有 video_url（官方文档「图片理解/音频理解」）
     if "generativelanguage.googleapis.com" in base:

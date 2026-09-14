@@ -180,9 +180,12 @@ async def transcribe(audio_path: str, base_url: str, api_key: str, model: str, *
     tmo = httpx.Timeout(connect=20.0, read=timeout, write=timeout, pool=20.0)
 
     headers = {"User-Agent": UA}
+    if api_key:
+        # ⚠️ 之前漏了这行：认证头根本没发出去，导致所有请求 401
+        headers["Authorization"] = f"Bearer {api_key}"
     for k, v in (extra_headers or {}).items():
         try:
-            headers[str(k)] = str(v)
+            headers[str(k)] = str(v)     # 自定义头可覆盖上面的默认鉴权方式
         except Exception:
             continue
 

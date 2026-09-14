@@ -35,9 +35,8 @@
       "allowed_adapters": {
         "type": "list",
         "name": "适配器白名单",
-        "default": [
-          "qq"
-        ]
+        "default": [],
+        "hint": "留空 = 不限制（所有适配器都处理）。填了就只处理这些适配器（按适配器名或平台名匹配，大小写不敏感）"
       },
       "auto_cache_video": {
         "type": "switch",
@@ -134,6 +133,12 @@
         "name": "模型名称",
         "default": "glm-5.3-flash"
       },
+      "label_1": {
+        "type": "string",
+        "name": "模型别名",
+        "default": "",
+        "hint": "给这组起个短名字（如 Agnes / GLM / 快速）。用户说「用 Agnes 分析」时 bot 会按这个名字选组。留空则只能用模型名或组号指定"
+      },
       "mode_1": {
         "type": "string",
         "name": "模式",
@@ -196,6 +201,12 @@
         "name": "模型名称",
         "default": "qwen3.8-max"
       },
+      "label_2": {
+        "type": "string",
+        "name": "模型别名",
+        "default": "",
+        "hint": "给这组起个短名字（如 Agnes / GLM / 快速）。用户说「用 Agnes 分析」时 bot 会按这个名字选组。留空则只能用模型名或组号指定"
+      },
       "mode_2": {
         "type": "string",
         "name": "模式",
@@ -254,6 +265,12 @@
         "name": "模型名称",
         "default": "gemini-2.5-pro"
       },
+      "label_3": {
+        "type": "string",
+        "name": "模型别名",
+        "default": "",
+        "hint": "给这组起个短名字（如 Agnes / GLM / 快速）。用户说「用 Agnes 分析」时 bot 会按这个名字选组。留空则只能用模型名或组号指定"
+      },
       "mode_3": {
         "type": "string",
         "name": "模式",
@@ -311,6 +328,12 @@
         "type": "string",
         "name": "模型名称",
         "default": "agnes-2.5-flash"
+      },
+      "label_4": {
+        "type": "string",
+        "name": "模型别名",
+        "default": "",
+        "hint": "给这组起个短名字（如 Agnes / GLM / 快速）。用户说「用 Agnes 分析」时 bot 会按这个名字选组。留空则只能用模型名或组号指定"
       },
       "mode_4": {
         "type": "string",
@@ -528,8 +551,8 @@
       "upload_enabled": {
         "type": "switch",
         "name": "上传换取公开链接",
-        "default": false,
-        "hint": "⚠️ 默认关闭。开启后 native 模式（如智谱 GLM 只接受公网 URL）会先把视频上传到文件中转服务——该视频将可通过链接被任何人访问，请注意隐私。frames 帧模式不受影响"
+        "default": true,
+        "hint": "开启后 native 模式会把视频上传到文件中转服务换取公网 URL（智谱 GLM 这类只接受 URL 的模型需要）。⚠️ 上传后该视频可通过链接被任何人访问，链接 3~100 天后失效；介意可关闭"
       },
       "upload_hosts": {
         "type": "list",
