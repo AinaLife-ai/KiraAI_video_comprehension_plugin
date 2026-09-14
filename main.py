@@ -1706,10 +1706,39 @@ class VideoComprehensionPlugin(BasePlugin):
                 f"🤖 {label}\n{link_line}━━━\n{analysis}{downgrade_note}\n━━━\n"
                 f"💡 追问用 session_id=\"{sess_id}\"")
 
+    @staticmethod
+    def _direct_ttl_text(url: str) -> str:
+        """从 B 站直链里解析 deadline 签名，算出剩余有效期"""
+        m = re.search(r"[?&]deadline=(\d+)", url or "")
+        if not m:
+            return "带签名"
+        try:
+            remain = int(m.group(1)) - int(time.time())
+        except Exception:
+            return "带签名"
+        if remain <= 0:
+            return "⚠️ 可能已失效"
+        if remain >= 3600:
+            return f"约 {remain // 3600} 小时后失效"
+        if remain >= 60:
+            return f"约 {remain // 60} 分钟后失效"
+        return f"约 {remain} 秒后失效"
+
     def _link_line(self, host_url: str) -> str:
-        """上传后的公开直链（告诉 bot，方便它转述或后续引用）"""
+        """给 bot 的链接提示。
+
+        - 上传到文件中转的链接：可分享、可长期引用
+        - B 站 temporary 直链：**带签名的时效链接**，只能现拉现用；
+          访问多少次都无法延长，想要长期分享得改用 send_video（发视频到QQ）。
+        """
         if not host_url:
             return ""
+        if "bilivideo" in host_url or "deadline=" in host_url:
+            return (f"🔗 视频直链(B站临时): {host_url}\n"
+                    f"   ⚠️ 带签名，{self._direct_ttl_text(host_url)}；"
+                    f"只能现取现用（反复访问**不会**延长有效期）。"
+                    f"需要长期分享请改用 send_video 把视频发到QQ，"
+                    f"或重新调用 analyze_video 取一条新链\n")
         return f"🔗 视频直链: {host_url}（临时公开链接，可直接分享或后续引用）\n"
 
     # ── 时间段分析（复用已下载的视频） ──
@@ -1843,13 +1872,11 @@ class VideoComprehensionPlugin(BasePlugin):
                     logger.warning("[VC] base64 回退压缩失败: %s", e)
             ans = await analyze_native(profile, vpath, question, ask_prompt,
                                        video_url=url)
-            is_direct = bool(url) and (
-                not self.upload_host or "bilivideo.com" in url or "bilibili" in url)
+            is_direct = bool(url) and ("bilivideo" in url or "deadline=" in url)
             tag = "native B站直链" if is_direct else ("native URL" if url else "native base64")
             if not is_full:
                 tag += " 片段"
-            # B站直链有时效、且对外不好用（需要 UA），不写进「视频直链」提示
-            return ans, clip_note, tag, ("" if is_direct else url)
+            return ans, clip_note, tag, url
 
         # native（全片或单段都走；多段走帧模式）
         if profile.mode == "native" and not multi:
