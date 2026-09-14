@@ -530,6 +530,39 @@ class VideoComprehensionPlugin(BasePlugin):
         return getattr(event.session, "sid", None) or getattr(event, "sid", "") or ""
 
     @staticmethod
+    def _is_self_message(event) -> bool:
+        """判断这条消息是不是 bot 自己发的（防御用）。
+
+        正常情况下适配器不会把自身消息上报：
+        - SnowLuma / NapCat 的 reportSelfMessage 默认 false
+        - 自身消息的 post_type 是 message_sent，而框架只处理 post_type == "message"
+
+        但这两条都是"外部默认值"，万一被改（或换实现），bot 自己发的B站链接
+        就会被自动钩子再发一遍 → **重复发送**。所以这里自己再挡一道。
+        """
+        try:
+            msg = getattr(event, "message", None)
+            if msg is None:
+                return False
+            self_id = str(getattr(msg, "self_id", "") or "")
+            sender = getattr(msg, "sender", None)
+            sender_id = str(getattr(sender, "user_id", "") or "")
+            if self_id and sender_id and self_id == sender_id:
+                return True
+            raw = getattr(msg, "raw_message", None)
+            if isinstance(raw, dict):
+                if str(raw.get("post_type") or "") == "message_sent":
+                    return True
+                # 兼容：部分实现把 sender/self 放在 sender 里
+                s = raw.get("sender")
+                if isinstance(s, dict) and str(raw.get("self_id") or "") and \
+                        str(s.get("user_id") or "") == str(raw.get("self_id")):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    @staticmethod
     def _normalize_bvid(raw) -> str:
         """把 bot 传来的值规范成 BV 号。
 
@@ -601,6 +634,10 @@ class VideoComprehensionPlugin(BasePlugin):
             return
         if not self._is_qq(event):
             return
+        # 防御：bot 自己发的消息（有些实现会上报）绝不能触发自动发送，
+        # 否则就会"自己刚发完又一个视频，钩子检测到链接再发一遍" → 重复刷屏
+        if self._is_self_message(event):
+            return
         sid = event.session.sid or ""
         if not sid:
             return
@@ -656,7 +693,10 @@ class VideoComprehensionPlugin(BasePlugin):
                 pass
 
         if not bvid:
-            logger.info("[VC] auto_send 未发现「明确的 B站链接」，跳过（裸 BV 号不触发）")
+            # 没有明确的B站链接是**常态**（群里绝大多数消息都没链接），静默跳过。
+            # 注意：这里千万不要打日志 —— 每条消息都会走到这，会疯狂刷屏，
+            # 而且"没触发"不代表检测有问题。真正需要关注的是「看到链接但解析失败」
+            # （上面 b23 那两条）和下方"检测到B站视频"。
             return
         # 记录"用来在上下文里定位这条消息"的匹配键。
         # ⚠️ 不能只用 bvid：消息里写的可能是 b23 短链（V5Xhy88 这种），
@@ -1231,6 +1271,10 @@ class VideoComprehensionPlugin(BasePlugin):
     @on.im_message(priority=Priority.HIGH)
     async def _detect(self, event: KiraMessageEvent, *_):
         if not self.enabled or not self._ok(event):
+            return
+        # 防御：bot 自己发的视频（如 send_video 发出去的）不必再当"收到的视频"
+        # 缓存/转写一遍 —— 省流量、省 ASR 费用
+        if self._is_self_message(event):
             return
         sid = self._sid(event)
         url = None

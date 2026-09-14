@@ -119,6 +119,19 @@ bot 主动调 analyze_video        → 任何时候都能用（不受 cache_scop
 
 > ⚠️ 最后一行很重要：`cache_scope` 只管"**要不要提前替你缓存**"，**从不限制 bot 主动分析**——工具调用永远能用（`bvid` 现下、`local_path` 直读、无参数则用最近缓存的视频）。
 
+### bot 自己发的消息不会触发
+
+插件会跳过 **bot 自身发的消息**（`self_id == sender.user_id`，或 `raw_message.post_type == "message_sent"`）——不会自动发送、也不会当"收到的视频"缓存。
+
+原本这靠两层外部默认值兜着：
+
+1. SnowLuma / NapCat 的 `reportSelfMessage` 默认 `false`（不上报自身消息）
+2. 自身消息的 `post_type` 是 `message_sent`，而框架只处理 `post_type == "message"`
+
+但这两条都是**外部默认值**，万一被改或换实现，bot 自己发的B站链接就会被钩子再发一遍（重复刷屏）。所以插件自己再挡一道，不依赖外部配置。
+
+> 效果：`send_video` 发出去的视频**不会**被自动钩子重新发一次，也不会被缓存/转写。
+
 ### B站链接的识别范围
 
 自动发送（`auto_send_link`）**只认「明确的 B站链接」**：
@@ -466,6 +479,7 @@ analyze_video(session_id="abc123", segments=[[10,30],[100,130]])   # 一次多�
 <details>
 <summary><b>📜 更新日志</b>（点击展开，共 20+ 个版本）</summary>
 
+- 1.16.5 — 新增**自身消息防御**：bot 自己发的消息（如 `send_video` 发出去的B站链接）不再触发自动发送与视频缓存。原本靠两层外部默认值兜着（SnowLuma/NapCat 的 `reportSelfMessage` 默认 false、自身消息 `post_type=message_sent` 而框架只处理 `message`），现在插件自己再挡一道：`self_id == sender.user_id`、或 `raw_message.post_type == "message_sent"` 一律跳过。避免"自己刚发完又被钩子发一遍"的重复刷屏
 - 1.16.4 — 修复**「已自动发送」标注对短链 / 小程序卡片消息不生效**（三个叠加的问题）：① 定位原始消息时又只从 `Text` 元素取文本，卡片不是 `Text` 类型 → 扫不到；② 匹配用的是解析出的 `BV` 号，而消息里写的是 `b23.tv/xxxx` 短链 → **永远匹配不上**；③ 记录在校验**之前**就被 pop 走 → 一轮没匹配上就永久丢失。现在：记 **b23 短链 id** 一起匹配、用 `_collect_chain_text()` 扫整条链（含卡片字段）、优先按 **message_id** 精确定位、**匹配成功才消费**记录（超时 5 分钟才清理）。同版另做两项调整：**自动发送改为只认「明确的 B站链接」**（`bilibili.com/video/BV…` / `b23.tv/…`），**裸 BV 号不再触发**——裸号在聊天里容易误触发，假号还会换来 `-400` 报错；**自动钩子的失败/异常只写日志、不再发到会话里**（要看就去看 cmd 日志）；另对传入的 BV 号做**规范化**（去空白 / 从链接抠号 / 修 `bv` 前缀），并把 `-400` 翻译成可读原因
 - 1.16.3 — **默认不再使用 `upload_file_stream`**（NapCat 第三方扩展 action）：新增 `napcat_stream_upload` 开关，**默认关闭**，直接用本地路径发送（AstrBot 等同类软件的做法，NapCat / SnowLuma 都能读）。修复在部分协议端「发视频时 WebSocket 断开 / 程序退出」的问题。另**修复 B站小程序卡片（`com.tencent.miniapp_01` 等）不被识别**：原来只从 `Text` 元素取文本，卡片不是 `Text` 类型导致链接提取不到，现改为扫描整条消息链所有元素的字段（含 dict / list）
 - 1.16.2 — **换新图标**（二次元动漫风：两位看板娘肩并肩一起看视频、互相分享，蓝白配色 + 弹幕气泡 + 小电视）；README 更新日志改为**默认折叠**；**修正多处与最新版不符的说明**——核心能力列表编号错乱（三个「3.」）、模型能力表里 Gemini 仍写着「不支持 video_url」（现已支持，会自动走原生 API）、补充 MiMo 行与 3 条已知限制
