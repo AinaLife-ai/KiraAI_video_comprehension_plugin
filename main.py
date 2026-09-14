@@ -50,6 +50,55 @@ from bili_dl import (search_bili, get_bili_info, get_ai_summary, download_bili_v
                      get_bili_direct_url)
 
 BILI_RE = re.compile(r"(BV[0-9A-Za-z]{10}|b23\.tv/[^\s]+|bilibili\.com/(?:video/|BV))", re.I)
+
+
+def _collect_chain_text(chain) -> str:
+    """收集消息链里所有可能带链接的文本。
+
+    ⚠️ 不能只看 Text 元素：QQ 小程序卡片（app=com.tencent.miniapp_01）之类的
+    元素不是 Text 类型，但它们的字段里带着 qqdocurl（B站短链）。
+    这里把每个元素的常见字符串字段（含 dict）都展开收集，只用于「找链接」，
+    不影响其它逻辑。
+    """
+    parts: list = []
+    try:
+        items = list(chain or [])
+    except Exception:
+        return ""
+    for ele in items:
+        try:
+            if isinstance(ele, Text):
+                t = getattr(ele, "text", "") or ""
+                if t:
+                    parts.append(t)
+                continue
+            # 非 Text 元素：展开它的属性（含 __dict__），只收字符串与 dict
+            attrs = {}
+            try:
+                attrs = dict(vars(ele))
+            except Exception:
+                attrs = {}
+            for key in ("text", "data", "json", "raw", "url", "content", "summary",
+                        "qqdocurl", "prompt", "desc", "title"):
+                v = getattr(ele, key, None)
+                if v is not None and key not in attrs:
+                    attrs[key] = v
+            for v in attrs.values():
+                if isinstance(v, str):
+                    if v:
+                        parts.append(v)
+                elif isinstance(v, dict):
+                    try:
+                        parts.append(json.dumps(v, ensure_ascii=False))
+                    except Exception:
+                        pass
+                elif isinstance(v, (list, tuple)):
+                    for x in v:
+                        if isinstance(x, str) and x:
+                            parts.append(x)
+        except Exception:
+            continue
+    return "\n".join(parts)
 BVID_RE = re.compile(r"BV[0-9A-Za-z]{10}")
 
 # 时间段分析限制
@@ -172,6 +221,10 @@ class VideoComprehensionPlugin(BasePlugin):
         self.bili_search_n = int(bs.get("bili_search_count", 5))
         self.bili_max_dl = int(bs.get("bili_max_download_sec", 600))
         self.auto_send_link = bs.get("auto_send_link", False)
+        # NapCat 的 upload_file_stream（第三方扩展 action，分块上传）—— 默认关闭。
+        # 官方 NapCat 没有它，同类软件（AstrBot 等）也不用它；直接用本地路径发送
+        # 对 NapCat / SnowLuma 都够用。开启后才尝试分块上传（失败仍会自动降级）。
+        self.napcat_stream = bool(bs.get("napcat_stream_upload", False))
         self.auto_send_allowed_sid = [str(s).strip() for s in bs.get("auto_send_allowed_sid", []) if str(s).strip()]
         self.search_show_desc = bs.get("search_show_desc", True)
         self.search_desc_max_chars = int(bs.get("search_desc_max_chars", 100))
@@ -519,18 +572,23 @@ class VideoComprehensionPlugin(BasePlugin):
 
         bvid = ""
 
-        # 1) message.chain 文本搜 BV（纯文本消息）
-        text = "".join(e.text for e in event.message.chain if isinstance(e, Text))
-        if text:
-            m = BVID_RE.search(text)
-            if m: bvid = m.group(0)
+        # 收集整条消息链里所有可能带链接的文本。
+        # ⚠️ 不能只看 Text 元素：QQ 小程序卡片（com.tencent.miniapp_01）等
+        #    元素不是 Text 类型，但它们的字段里带着 qqdocurl（B站短链）。
+        text = _collect_chain_text(event.message.chain)
 
-        # 2) 文本没有 BV 但 b23 短链 → extract_bvid
-        if not bvid and text:
+        # 1) 精确搜 BV 号（BVID_RE 就是 BV[0-9A-Za-z]{10}，不会脏匹配）
+        m = BVID_RE.search(text)
+        if m:
+            bvid = m.group(0)
+
+        # 2) 没有 BV 号但有 b23 短链 → 解析成 BV 号
+        if not bvid:
             m = re.search(r'b23\.tv/([0-9A-Za-z]+)', text)
             if m:
                 try: bvid = await extract_bvid(f"https://b23.tv/{m.group(1)}", self.dl_timeout)
-                except: pass
+                except Exception:
+                    logger.info("[VC] b23 短链解析失败: %s", m.group(1))
 
         # 3) raw_message JSON（小程序卡片/app分享的 qqdocurl 里藏 b23）
         if not bvid:
@@ -1327,13 +1385,15 @@ class VideoComprehensionPlugin(BasePlugin):
             is_group = "gm:" in send_sid
             target_id = int(send_sid.split(":")[-1])
 
-            # ── NapCat 大文件分块上传（可选扩展，官方 NapCat 无此 action，不支持则降级） ──
-            file_ref = out_path  # 兜底：直接发本地路径（NapCat 可读本地文件）
+            # ── NapCat 分块上传（第三方扩展 action，**默认关闭**，配置可开） ──
+            # 直接用本地路径发送是标准做法（AstrBot 等同类软件都这么做），
+            # 对 NapCat / SnowLuma 都能工作。这里只在用户显式开启时才尝试。
+            file_ref = out_path  # 兜底/默认：直接发本地路径
             try:
                 file_size = Path(out_path).stat().st_size
             except Exception:
                 file_size = 0
-            if file_size > 1024 * 1024 and not self._stream_unsupported:
+            if self.napcat_stream and file_size > 1024 * 1024 and not self._stream_unsupported:
                 try:
                     filename = f"{bvid}.mp4"
                     chunk_size = 512 * 1024

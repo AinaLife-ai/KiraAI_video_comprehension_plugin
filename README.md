@@ -119,6 +119,19 @@ bot 主动调 analyze_video        → 任何时候都能用（不受 cache_scop
 
 > ⚠️ 最后一行很重要：`cache_scope` 只管"**要不要提前替你缓存**"，**从不限制 bot 主动分析**——工具调用永远能用（`bvid` 现下、`local_path` 直读、无参数则用最近缓存的视频）。
 
+### B站链接的识别范围
+
+自动发送（`auto_send_link`）会从**整条消息链**里找 B站链接，覆盖：
+
+| 形式 | 例子 |
+|------|------|
+| 纯文本 BV 号 | `BV1xx411c7mD` |
+| b23 短链 | `https://b23.tv/xxxxxx`（会自动解析成 BV 号）|
+| bilibili.com 链接 | `https://www.bilibili.com/video/BV...` |
+| **QQ 小程序卡片** | `{"app":"com.tencent.miniapp_01", …, "qqdocurl":"https://b23.tv/…"}` |
+
+> 卡片不是 `Text` 类型元素，所以插件扫描的是**每个元素的所有字符串字段**（含 dict / list），不依赖具体元素类型 —— 适配器把卡片塞成 `Json` / `Unknown` 都能识别。
+
 ### 消息改写：bot 不会再误判"看不到视频"
 
 KiraAI 框架在渲染消息时会写一句误导文本（体积未知就写成"超过 10MB 未缓存"）。插件会把它**改写**成准确信息：
@@ -429,7 +442,7 @@ analyze_video(session_id="abc123", segments=[[10,30],[100,130]])   # 一次多�
 
 - 场景变化检测为启发式（基于 I 帧与相邻帧间隔突变），不是逐帧图像差异比对
 - B 站搜索接口在无 cookie 时可能被风控限制
-- NapCat 官方**没有** `upload_file_stream` action（那是第三方扩展）；插件会尝试一次，失败后记住并直接发送本地路径
+- **NapCat 官方没有 `upload_file_stream` action**（那是第三方扩展）。本插件**默认不使用它**（`napcat_stream_upload` 默认关），直接发本地路径——这也是 AstrBot 等同类软件的做法。个别协议端在这条扩展链路上出现过 **WebSocket 断开 / 程序退出**，默认关闭即可规避；只有确实需要"客户端与 bot 不共盘"的跨机器上传时才建议开启
 - **B 站临时直链有时效**（URL 里的 `deadline=` 签名）：只能现取现用，反复访问**不会**延长有效期；要长期分享请用 `send_video`
 - **Gemini 原生通道**用 base64 内联传视频，受 20MB 限制（超了自动回退帧模式）；要传更大的需要走 Gemini Files API（暂未实现）
 - **MiMo** 的 base64 视频上限为 50MB（公网 URL 无此限制）
@@ -440,6 +453,7 @@ analyze_video(session_id="abc123", segments=[[10,30],[100,130]])   # 一次多�
 <details>
 <summary><b>📜 更新日志</b>（点击展开，共 20+ 个版本）</summary>
 
+- 1.16.3 — **默认不再使用 `upload_file_stream`**（NapCat 第三方扩展 action）：新增 `napcat_stream_upload` 开关，**默认关闭**，直接用本地路径发送（AstrBot 等同类软件的做法，NapCat / SnowLuma 都能读）。修复在部分协议端「发视频时 WebSocket 断开 / 程序退出」的问题。另**修复 B站小程序卡片（`com.tencent.miniapp_01` 等）不被识别**：原来只从 `Text` 元素取文本，卡片不是 `Text` 类型导致链接提取不到，现改为扫描整条消息链所有元素的字段（含 dict / list）
 - 1.16.2 — **换新图标**（二次元动漫风：两位看板娘肩并肩一起看视频、互相分享，蓝白配色 + 弹幕气泡 + 小电视）；README 更新日志改为**默认折叠**；**修正多处与最新版不符的说明**——核心能力列表编号错乱（三个「3.」）、模型能力表里 Gemini 仍写着「不支持 video_url」（现已支持，会自动走原生 API）、补充 MiMo 行与 3 条已知限制
 - 1.16.1 — 修正 `native_audio` 的配置提示：原先四组共用同一段文案，现在**按组区分** —— 能听到音频的组（MiMo/Gemini）才写「使用本组可无需额外语音识别，如只用本组可直接关闭语音识别选项」；听不到音频的组（GLM/备用）改为说明**为什么该保持关闭**（开了会连转写文字都没有，声音信息彻底丢失）
 - 1.16.0 — 每组新增 **`native_audio`**（模型自带音视频理解 → 跳过 ASR 转写）：**MiMo/Gemini 默认开**（真能听到），GLM/备用默认关（`video_url` 只抽帧，开了反而丢失声音信息）；**B站字幕不受该开关影响**；所有启用组都 native_audio 时后台连 ASR 都不跑。**MiMo 组替代原 Qwen 组**（`mimo-v2.5`，原生图像/视频/音频/文本，OpenAI 兼容）。**Gemini 改走原生 API**（`generateContent` + `inline_data`，音视频一起理解，不再只是降级帧模式）
