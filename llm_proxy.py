@@ -220,12 +220,28 @@ async def analyze_native(profile: ModelProfile, video_path: str,
             f"不允许走原生视频调用（应走拼图帧模式）"
         )
     base = (profile.api_base or "").lower()
-    # Gemini：它的 OpenAI 兼容层没有 video_url（官方文档只有「图片理解/音频理解」），
-    # 所以这里自动改走 Gemini **原生 API**（generateContent + inline_data），
-    # 那条路既支持视频也支持音频 —— 配合 native_audio 开关就能一步到位。
-    if "generativelanguage.googleapis.com" in base:
-        return await analyze_gemini_native(profile, video_path, question,
-                                           default_prompt)
+    name_l = (profile.name or "").lower()
+    # ── Gemini 特判 ───────────────────────────────────────────────
+    # Gemini 官方支持的视频输入只有四种：Files API（上传）、Cloud Storage、
+    # 内嵌数据（base64，<100MB）、**YouTube 网址**。
+    # 官方列表里**没有「任意公开 HTTPS 视频链接」**这个选项 —— 给它 B站直链
+    # 之类的 URL 它不认；而它的 OpenAI 兼容层更是连 video_url 字段都没有，
+    # 传了会被**静默忽略**（表现为模型回答"我没看到视频"，属假成功，最坑）。
+    #
+    # 所以 Gemini 只走「上传」：官方端点 → 原生 generateContent + inline_data
+    #（内联上传）；第三方中转 → 明确失败，交给上层降级到帧模式，绝不假成功。
+    looks_gemini = ("generativelanguage" in base) or ("gemini" in name_l)
+    if looks_gemini:
+        if "generativelanguage.googleapis.com" in base:
+            return await analyze_gemini_native(profile, video_path, question,
+                                               default_prompt)
+        raise RuntimeError(
+            "Gemini 不能接收普通公网视频链接（官方只支持 Files API 上传 / base64 内联 / "
+            "YouTube 网址），而它的 OpenAI 兼容层也没有 video_url 字段 —— "
+            "继续传会被静默忽略，模型会回答「没看到视频」。"
+            "已改用帧模式。若想用原生视频，请把本组 api_base 改成官方端点 "
+            "https://generativelanguage.googleapis.com/v1beta"
+        )
     if video_url:
         url = video_url
     else:
