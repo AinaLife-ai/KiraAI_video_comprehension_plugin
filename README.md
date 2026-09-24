@@ -541,11 +541,15 @@ bot：《原神》4.2 前瞻直播，主要看点：…        ← 完成时（�
 
 ```bash
 cd <插件目录>
-python3 tests/selfcheck.py    # 88 项：静态判据 + 真类行为判据
-python3 tests/e2e_flow.py     # 17 项：提交 → 后台 → 通告 全链路
+python3 tests/selfcheck.py     # 100 项：静态判据 + 真类行为判据
+python3 tests/smoke_paths.py   # 全参数组合：每条调用路径都不炸
+python3 tests/e2e_flow.py      # 17 项：提交 → 后台 → 通告 全链路
+python3 tests/audit_paths.py   # 失败路径 / 迁移边界 / 配置一致性
+python3 tests/audit_notice.py  # 通告合并、竞态、缓冲滞留
+python3 tests/audit_runtime.py # 并发压力、资源泄漏、terminate
 ```
 
-不需要 KiraAI 本体与网络（`e2e_flow` 用桩件替换 `core` 包与模型调用）。
+不需要 KiraAI 本体与网络（用桩件替换 `core` 包与模型调用）。
 
 ## 版本
 
@@ -555,6 +559,15 @@ python3 tests/e2e_flow.py     # 17 项：提交 → 后台 → 通告 全链路
 - **1.17.0** — **异步化 + 并发控制 + 与框架工具超时彻底脱钩**
   - **异步分析（默认开）**：`analyze_video` 首次分析改为**后台执行**，工具**毫秒级返回**（只回一句「已开始分析，请告知用户稍候」），下载/抽帧/转写/模型调用全在后台跑；完成后用 `publish_notice` 把结果连同「请用你自己的语气讲给用户」的回灌通知交给 bot。**追问仍为同步**（拼图已在内存，秒级出结果），可用 `async_followup` 改为异步。
   - **与框架工具超时脱钩（重点）**：新增 `section_async` 配置节 —— `analysis_budget_sec`（软预算，默认 **200 秒**：到点不是失败，而是**转后台继续**，结果照常交回）与 `pipeline_hard_timeout_sec`（硬上限，默认 0=不设）。三层保证：① 提交路径永不 await 分析体；② **分析重活全部移出事件循环**（抽帧逐帧 ffmpeg、ffprobe 探测、PIL 拼图、JPEG→base64 全部 `to_thread`，否则会拖住全局计时器，包括框架的工具超时）；③ 即使工具协程被框架 `wait_for` 取消，任务依然存活并最终发通告。**插件自己的时间尺度与框架 `tool_call_timeout` 完全独立**（实测：框架掐断后后台照常跑完）。
+  - **二次全量审计修复（7 项，含 3 个真 bug）**：
+    · **时段分析被重复调用防护误拦**（真 bug）：去重键没带时间段与提问，导致「先看 0~60s、再看 100~160s」第二次直接被拒；
+    · **同步路径下排队超时会向框架抛 `CancelledError`**（真 bug）：框架会判成工具失败，现改为返回明确原因文案；
+    · **通告回灌有竞态**（真 bug）：`publish_notice` 期间新完成的任务不会重排 flush，通知会卡在缓冲里直到下次才发出；现改为 flush 期间循环取走；
+    · **`_prefer_local` 把 B站来源改成 local**：会连带丢掉 B站官方字幕（拿不到 cid）、AI 总结与真实标题；改为只对非 B站来源复用本地文件（B站的不重复下载由 `download_bili_video` 自己处理）；
+    · **`pipeline_hard_timeout_sec` 原先只是「读了个变量」**（空配置）：现已真正实现（到点强制中止并通告失败，且不会跳过通告）；
+    · **排队超时被 `cancelled` 覆盖状态**：通告会误报成「任务已取消（插件重载）」；
+    · 参数链路加固：`segs/segments` 两种写法都兼容，且已由具名参数承接的键绝不会再随 `**kw` 传下去（否则撞名 `TypeError`，时段分析 100% 失败）。
+  - **测试套件扩充**：`tests/` 现有 6 个套件（`selfcheck` 100 项、`smoke_paths` 全参数组合、`e2e_flow` 17 项、`audit_paths`、`audit_notice`、`audit_runtime`），覆盖参数链路、失败路径、迁移边界、并发压力、通告竞态、资源泄漏。
   - **并行看视频**：每会话 `max_parallel_per_chat`（默认 **3**）+ 全局 `max_parallel_global`（默认 6），超出排队；排队超 `queue_timeout_sec`（默认 600 秒）则明确告知「未执行」，**不会静默丢失**。追问不计入并发上限。多个任务几乎同时完成时按 `notice_coalesce_sec`（默认 2 秒）**合并成一条通知**，避免连开多轮对话。
   - **缓存/转写也纳入闸**：此前收到视频即裸 `create_task` 下载+转写（含 VAD 与多路 ASR 切片），群里连发多个视频会同时开多路重活；现统一走后台闸。
   - **其他修复**：

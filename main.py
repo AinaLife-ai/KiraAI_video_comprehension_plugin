@@ -215,6 +215,7 @@ class VideoComprehensionPlugin(BasePlugin):
         self._global_running = 0
         self._slot_events: dict[str, asyncio.Event] = {}  # sid → 槽位释放唤醒
         self._notice_buffer: dict[str, list] = {}       # sid → [已完成待合并通告的任务]
+        self._flushing: set = set()                     # 正在发通告的会话（防竞态）
         self._notice_tasks: set = set()
         self._background_tasks: set = set()             # 后台任务引用（防被 GC 回收）
         self._migrated_keys: set = set()
@@ -662,6 +663,7 @@ class VideoComprehensionPlugin(BasePlugin):
                 bt.cancel()
         self._background_tasks.clear()
         self._notice_buffer.clear()
+        getattr(self, "_flushing", set()).clear() if hasattr(self, "_flushing") else None
         self._pending.clear(); self._sessions.clear(); self._sid_sessions.clear()
         self._cached_videos.clear()
         self._video_failures.clear()
@@ -1047,6 +1049,7 @@ class VideoComprehensionPlugin(BasePlugin):
 
         注意：**不在这里 await 工具协程**。真正调用方是 _await_or_handoff()。
         """
+        hard_task = None
         try:
             if use_gate and not task.reserved:
                 # 排队中：等槽位事件，直到有位置或任务被判超时/取消
@@ -1068,24 +1071,54 @@ class VideoComprehensionPlugin(BasePlugin):
                 task.started_at = time.time()
                 task.progress = "正在处理"
 
-            try:
-                result = await runner(task)
-            except asyncio.CancelledError:
-                task.state = "cancelled"
-                task.error = "任务已取消（插件重载或服务关闭）"
-                task.finished_at = time.time()
-                raise
-            except Exception as e:
-                logger.exception("[VC] 任务 %s 执行异常", task.task_id)
-                task.state = "failed"
-                task.error = f"{type(e).__name__}: {e}"
-                task.finished_at = time.time()
-            else:
-                if task.state not in ("failed", "rejected"):
-                    task.state = "done"
-                    task.result = result or ""
+            # 硬上限（默认 0 = 不设）：真正的强制中止。
+            # ⚠️ 不能在这里 return —— 那会跳过末尾的 _notify_done，
+            #    失败就再也不会告诉用户。用标记位走到统一收尾。
+            result = None
+            if self.pipeline_hard_timeout_sec > 0:
+                hard_task = asyncio.ensure_future(runner(task))
+                try:
+                    result = await asyncio.wait_for(
+                        asyncio.shield(hard_task),
+                        timeout=self.pipeline_hard_timeout_sec)
+                except asyncio.TimeoutError:
+                    hard_task.cancel()
+                    try:
+                        await hard_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                    task.state = "failed"
+                    task.error = (f"超过硬上限 {self.pipeline_hard_timeout_sec} 秒仍未完成，已中止"
+                                  f"（下载 / 抽帧 / 模型响应某一步卡住）")
+                    task.progress = "已中止（超过硬上限）"
                     task.finished_at = time.time()
+                    logger.warning("[VC] 任务 %s 超过硬上限 %ds，已强制中止",
+                                   task.task_id, self.pipeline_hard_timeout_sec)
+            else:
+                result = await runner(task)
+
+            if task.state == "running":
+                task.state = "done"
+                task.result = result or ""
+                task.finished_at = time.time()
+        except asyncio.CancelledError:
+            if hard_task and not hard_task.done():
+                hard_task.cancel()
+            # ⚠️ 排队看门狗会先把状态标成 rejected 再 cancel 这里 ——
+            #    不能无条件覆盖成 cancelled，否则通告会误报成
+            #    「任务已取消（插件重载或服务关闭）」
+            if task.state not in ("rejected", "failed", "done"):
+                task.state = "cancelled"
+                task.error = task.error or "任务已取消（插件重载或服务关闭）"
+                task.finished_at = task.finished_at or time.time()
+            raise
+        except Exception as e:
+            logger.exception("[VC] 任务 %s 执行异常", task.task_id)
+            task.state = "failed"
+            task.error = f"{type(e).__name__}: {e}"
+            task.finished_at = time.time()
         finally:
+            # 统一收尾：状态兜底 + 归还槽位 + 取消排队看门狗
             if task.state == "running":
                 task.state = "failed"
                 task.error = task.error or "任务未正常结束"
@@ -1112,20 +1145,30 @@ class VideoComprehensionPlugin(BasePlugin):
     # ── 完成通告（合并窗口，减少 LLM 轮次） ──
 
     async def _notify_done(self, task: VideoTask):
+        """把已完成的任务放进合并缓冲，并在窗口后统一发出。"""
         if task.notified:
             return
         task.notified = True
-        buf = self._notice_buffer.setdefault(task.sid, [])
-        buf.append(task)
+        self._notice_buffer.setdefault(task.sid, []).append(task)
         if self.notice_coalesce_sec <= 0:
             await self._flush_notices(task.sid)
             return
-        if not any(getattr(t, "get_name", lambda: "")() == f"vc_notice_{task.sid}"
-                   for t in self._notice_tasks if not t.done()):
-            nt = self._spawn(self._notice_flush_later(task.sid),
-                             name=f"vc_notice_{task.sid}")
-            self._notice_tasks.add(nt)
-            nt.add_done_callback(self._notice_tasks.discard)
+        self._ensure_flush_task(task.sid)
+
+    def _ensure_flush_task(self, sid: str):
+        # 正在 flush 中：它会循环把新到达的任务一并取走，不必再排一个
+        if sid in getattr(self, "_flushing", set()):
+            return
+        name = f"vc_notice_{sid}"
+        for t in list(self._notice_tasks):
+            if t.done():
+                self._notice_tasks.discard(t)
+                continue
+            if t.get_name() == name:
+                return                      # 已有排队的 flush，等它就行
+        nt = self._spawn(self._notice_flush_later(sid), name=name)
+        self._notice_tasks.add(nt)
+        nt.add_done_callback(self._notice_tasks.discard)
 
     async def _notice_flush_later(self, sid: str):
         try:
@@ -1135,9 +1178,43 @@ class VideoComprehensionPlugin(BasePlugin):
         await self._flush_notices(sid)
 
     async def _flush_notices(self, sid: str):
-        tasks = self._notice_buffer.pop(sid, []) or []
-        if not tasks:
-            return
+        """把缓冲里的任务组装成通告并发出去。
+
+        ⚠️ 原先的实现有个竞态：**在 await publish_notice 期间新完成的任务**，
+        因为「同名 flush 任务还没 done」而不会再排 flush ⇒ 那条通知就卡在
+        buffer 里，直到下一次有任务完成才被带出去（用户表现为「早完成了却没有
+        任何消息」）。现在改成：flush 期间循环取走新到达的，收尾再检查一次残留。
+        """
+        flushing = getattr(self, "_flushing", None)
+        if flushing is None:
+            flushing = set()
+            self._flushing = flushing
+        if sid in flushing:
+            return                          # 已有 flush 在处理这个会话
+        flushing.add(sid)
+        try:
+            for _ in range(6):
+                tasks = self._notice_buffer.pop(sid, []) or []
+                if not tasks:
+                    return
+                text = self._compose_notice(tasks)
+                if not text:
+                    continue
+                try:
+                    await self.ctx.publish_notice(sid, MessageChain([Text(text)]),
+                                                  is_mentioned=True)
+                    logger.info("[VC] 已回灌分析完成通告（%d 条任务）→ %s", len(tasks), sid)
+                except Exception:
+                    logger.exception("[VC] 回灌分析通告失败")
+                    return
+        finally:
+            flushing.discard(sid)
+        # 极端情况下（持续有新任务）还留了残留 → 再排一次，保证不丢
+        if self._notice_buffer.get(sid):
+            self._ensure_flush_task(sid)
+
+    def _compose_notice(self, tasks: list) -> str:
+        """把一批已完成任务组装成一条通告文本"""
         done = [t for t in tasks if t.state == "done"]
         failed = [t for t in tasks if t.state == "failed"]
         rejected = [t for t in tasks if t.state == "rejected"]
@@ -1153,14 +1230,7 @@ class VideoComprehensionPlugin(BasePlugin):
             parts.append("【系统通知 · 视频分析已取消】\n"
                          "任务被取消（插件重载或服务关闭）。如果是插件重载导致的，"
                          "请告知用户稍后重新发起即可。")
-        text = "\n\n".join(p for p in parts if p)
-        if not text:
-            return
-        try:
-            await self.ctx.publish_notice(sid, MessageChain([Text(text)]), is_mentioned=True)
-            logger.info("[VC] 已回灌分析完成通告（%d 条任务）→ %s", len(tasks), sid)
-        except Exception:
-            logger.exception("[VC] 回灌分析通告失败")
+        return "\n\n".join(p for p in parts if p)
 
     def _notice_success(self, tasks: list) -> str:
         """成功通告：多条任务合并成一条，避免连开多轮对话。"""
@@ -1219,6 +1289,10 @@ class VideoComprehensionPlugin(BasePlugin):
         返回 ("done", 结果文本) / ("failed", 错误) / ("handoff", None) 三态 ——
         **不能用 None 同时表示「失败」和「转后台」**（曾导致分析失败被误报成
         「还在看，再等一下」，用户永远等不到结果）。
+
+        ⚠️ 排队看门狗在拒绝任务时会 cancel 任务本体，而这里 shield 住的就是它
+        ⇒ 等待会抛 CancelledError。**这时不能往上传**（框架会判成工具失败），
+        要识别成「任务已被拒绝」并正常返回文案。
         """
         body = task.asyncio_task
         if body is None:
@@ -1233,6 +1307,12 @@ class VideoComprehensionPlugin(BasePlugin):
                         task.task_id, budget)
             return ("handoff", None)
         except asyncio.CancelledError:
+            # 区分两种来源：
+            #   ① 任务本体被「排队看门狗」取消 → 这是正常业务结果，正常返回文案
+            #   ② 外层（框架的 wait_for）取消我们 → 任务必须继续活着（L3），往上抛
+            if task.state in ("rejected", "failed", "cancelled"):
+                logger.info("[VC] 任务 %s 已被取消/拒绝，向工具返回明确原因", task.task_id)
+                return ("failed", task.error or "任务未执行")
             # 框架的 wait_for 掐断了工具协程 —— 任务必须继续活着（L3）
             task.budget_exceeded = True
             task.progress = "框架工具超时，已转后台继续"
@@ -1241,6 +1321,8 @@ class VideoComprehensionPlugin(BasePlugin):
             raise
         if task.state == "done":
             return ("done", task.result)
+        if task.state == "rejected":
+            return ("failed", task.error or "排队超时未执行")
         return ("failed", task.error or "未知原因")
 
     # ── 提交文案 ──
@@ -2507,14 +2589,20 @@ class VideoComprehensionPlugin(BasePlugin):
         title = kw.pop("title", "") or ""
         detail = kw.pop("detail", "") or ""
         question = kw.pop("question", "") or ""
-        segs = kw.pop("segments", None)
+        # 兼容两种调用方写法（segs= 与 segments=），并确保不残留到 **kw
+        segs = kw.pop("segs", None) or kw.pop("segments", None)
         model_spec = kw.pop("model_spec", None)
+        # 防御：这些键已由具名参数承接，**绝不能**再随 **kw 传下去
+        # （否则会与形参撞名 → TypeError，时间段分析会 100% 失败）
+        for _k in ("segs", "segments", "question", "model_spec", "sess", "title", "detail"):
+            kw.pop(_k, None)
 
         run_sync = (kind == "followup" and not self.async_followup) \
             or (kind != "followup" and not self.async_analyze)
 
-        # 重复调用防护：同一会话同一来源已有在跑的任务 → 直接告知，不重复开跑
-        dup = self._find_duplicate(sid, kind, kw, sess)
+        dup_key = self._dup_key_for(kind, kw, sess, segs, question)
+        # 重复调用防护：同一会话同一来源（且同一时间段）已有在跑的任务 → 不重复开跑
+        dup = self._find_duplicate(sid, dup_key)
         if dup is not None:
             return (f"ℹ️ 该分析已在后台进行中（任务号 {dup.task_id}），"
                     f"完成后会自动把结果交给你。\n"
@@ -2525,7 +2613,6 @@ class VideoComprehensionPlugin(BasePlugin):
                                         segs=segs, model_spec=model_spec, **kw)
 
         # ── 异步提交 ──
-        dup_key = self._dup_key_for(kind, kw, sess)
         task = self._submit_task(
             sid, kind, title, detail,
             runner=lambda t: self._execute(t, kind, sess=sess, question=question,
@@ -2536,16 +2623,28 @@ class VideoComprehensionPlugin(BasePlugin):
         return self._ack_submitted(task, self._running_count(sid))
 
     @staticmethod
-    def _dup_key_for(kind: str, kw: dict, sess) -> str:
-        """去重键：同一会话 + 同一来源 + 同一类型 → 视为重复调用"""
+    def _dup_key_for(kind: str, kw: dict, sess, segs=None, question: str = "") -> str:
+        """去重键：同一会话 + 同一来源 + 同一类型（+ 同一时间段 + 同一问题）→ 视为重复调用
+
+        ⚠️ 时间段必须进 key：否则「先看 0~60s、再看 100~160s」会被误判成重复调用，
+        第二个请求直接被拦下（用户换个时间段问就永远得不到回答）。
+        同理，显式问题也要进 key：「看 0~10s」和「看 0~10s 并回答某问题」是两回事。
+        """
         if kind == "followup":
             return ""
         key = kw.get("source_url") or (sess.session_id if sess else "")
-        return f"{kind}:{key}" if key else ""
+        if not key:
+            return ""
+        parts = [kind, key]
+        if kind == "segment":
+            seg_tag = ",".join(f"{float(s):.0f}-{float(e):.0f}" for s, e in (segs or []))
+            parts.append(seg_tag)
+        if question:
+            parts.append(question.strip()[:80])
+        return ":".join(parts)
 
-    def _find_duplicate(self, sid: str, kind: str, kw: dict, sess):
+    def _find_duplicate(self, sid: str, dup_key: str):
         """同一会话里是否已有等价任务在跑（防止 bot 重复调用导致重复下载/扣费）"""
-        dup_key = self._dup_key_for(kind, kw, sess)
         if not dup_key:
             return None
         for t in self._tasks.values():
@@ -2579,7 +2678,16 @@ class VideoComprehensionPlugin(BasePlugin):
             return self._ack_handoff(task)
         if state == "done" and payload:
             return payload
-        return f"⚠️ 分析失败：{payload or '未知原因'}\n请把原因转述给用户。"
+        return self._sync_fail_text(payload)
+
+    @staticmethod
+    def _sync_fail_text(reason: str) -> str:
+        """同步路径失败文案：区分「排队没排上」与「真失败」，别一律说失败"""
+        reason = reason or "未知原因"
+        if "排队" in reason or "仍未轮到" in reason:
+            return (f"🕐 本次没有执行：{reason}\n"
+                    "请把情况告诉用户（前面的还在处理），让他稍后再发一次。")
+        return f"⚠️ 分析失败：{reason}\n请把原因转述给用户。"
 
     async def _execute(self, task: VideoTask, kind: str, sess=None, question: str = "",
                        segs=None, model_spec=None, **kw) -> str:
@@ -2633,18 +2741,19 @@ class VideoComprehensionPlugin(BasePlugin):
                                   model_spec=model_spec)
 
     def _prefer_local(self, source_url: str, source_type: str, bvid: str, sid: str):
-        """若本地已有该视频缓存，直接用本地文件（省一次完整下载）。
+        """若本地已有该视频缓存，直接复用本地文件（省一次完整下载）。
 
         M1：原先收视频时缓存到 other_cache_dir，分析时 process_video 又走 URL
-        分支下一份 —— 同一个视频下载两次。这里在入口就把 URL 换成本地路径。
+        分支下一份 —— 同一个视频下载两次。
+
+        ⚠️ 关键：**只对「非 B站」来源做这个替换**。
+        B站来源一旦改成 local，`_vision` 就走不到 `stype == "bilibili"` 分支，
+        会连带丢掉 **B站官方字幕（cid 也拿不到）、AI 总结、真实标题**。
+        B站的「不重复下载」由 `download_bili_video` 自己处理
+        （文件已存在且非空就直接返回，见 bili_dl.py:283），不需要在这里替换。
         """
         try:
-            if source_type == "bilibili" and bvid:
-                cached_path = os.path.join(self.bili_cache_dir, f"{bvid}.mp4")
-                if os.path.isfile(cached_path) and os.path.getsize(cached_path) > 0:
-                    logger.info("[VC] 复用已下载的B站视频: %s", os.path.basename(cached_path))
-                    return cached_path, "local", bvid
-            if source_type == "onebot" and source_url.startswith(("http://", "https://")):
+            if source_type != "bilibili" and source_url.startswith(("http://", "https://")):
                 # 自动缓存过的文件（按原始文件名后缀匹配）
                 name = os.path.basename(source_url.split("?")[0]) or ""
                 if name:
@@ -2652,12 +2761,13 @@ class VideoComprehensionPlugin(BasePlugin):
                     if hit:
                         logger.info("[VC] 复用已缓存的视频: %s", os.path.basename(hit))
                         return hit, "local", bvid
-            # 会话最近的缓存里找（同一个视频被反复引用时最有效）
-            for c in (self._cached_videos.get(sid) or [])[::-1]:
-                p = c.get("path") or ""
-                if p and os.path.isfile(p) and c.get("orig_name") and \
-                        c["orig_name"] in source_url:
-                    return p, "local", bvid
+                # 会话最近的缓存里找（同一个视频被反复引用时最有效）
+                for c in (self._cached_videos.get(sid) or [])[::-1]:
+                    p = c.get("path") or ""
+                    if p and os.path.isfile(p) and c.get("orig_name") and \
+                            c["orig_name"] in source_url:
+                        logger.info("[VC] 复用会话缓存的视频: %s", os.path.basename(p))
+                        return p, "local", bvid
         except Exception as e:
             logger.debug("[VC] 本地复用检查失败: %s", e)
         return source_url, source_type, bvid

@@ -116,7 +116,9 @@ def static_checks():
           "budget_exceeded = True" in main_code and "转为后台" in main_src or
           "budget_exceeded" in main_code)
     check("L3 捕获取消后不杀任务（raise 前不 cancel）",
-          re.search(r"except asyncio\.CancelledError:[\s\S]{0,400}任务已转后台继续", main_src) is not None)
+          re.search(r"except asyncio\.CancelledError:[\s\S]{0,900}任务已转后台继续", main_src) is not None
+          and re.search(r'if task\.state in \("rejected", "failed", "cancelled"\):',
+                        main_code) is not None)
 
     # ── 并发闸 ──
     check("并发：每会话闸", "max_parallel_per_chat" in main_code and "Semaphore" in main_code)
@@ -193,6 +195,33 @@ def static_checks():
     check("N5 work 目录带随机后缀", "uuid.uuid4().hex[:6]" in main_code)
     check("并发：B站同名文件下载串行化（防同视频并发写同一文件）",
           'async with self._session_lock(f"bili:{bvid}")' in main_code)
+
+    # ── 审计（第二轮全量复核）新增的判据 ──
+    check("审计：_prefer_local 不动 B站来源（否则丢字幕/AI总结）",
+          'if source_type != "bilibili" and source_url.startswith' in main_code)
+    check("审计：硬上限真的被使用（不是空配置）",
+          main_code.count("pipeline_hard_timeout_sec") >= 2
+          and "超过硬上限" in main_src)
+    check("审计：通告 flush 竞态已修（flush 期间循环取走新任务）",
+          "_flushing" in main_code and "_compose_notice" in main_code)
+    check("审计：排队超时不被 canceled 覆盖",
+          re.search(r"CancelledError:[\s\S]{0,300}if task\.state not in \(\"rejected\"", main_code)
+          is not None)
+    check("审计：段分析与提问参与去重键",
+          "parts.append(seg_tag)" in main_code and "parts.append(question.strip()" in main_code)
+    check("审计：_submit_or_run 参数不残留到 **kw（防 TypeError）",
+          "for _k in (\"segs\", \"segments\", \"question\"" in main_code)
+    check("审计：抽帧区间调用参数与签名一致（避免 TypeError）",
+          "await asyncio.to_thread(\n            _extract_range, video_path, out_dir, all_frames, s, e, n,\n            scene_threshold, si)" in read("video_processor.py"))
+    check("审计：任务/通告/锁 三张表都有清理（无泄漏）",
+          "_prune_tasks" in main_code and "flushing.discard(sid)" in main_code
+          and "self._locks.pop(k, None)" in main_code)
+    check("审计：flush 期间新任务不会卡在缓冲（循环取走）",
+          "for _ in range(6):" in main_code)
+    check("审计：排队被拒时同步路径返回明确原因（不抛 CancelledError）",
+          "_sync_fail_text" in main_code and "本次没有执行" in main_src)
+    check("审计：硬上限不 return 跳过通告（统一收尾）",
+          re.search(r"hard_task\.cancel\(\)[\s\S]{0,700}finally:", main_code) is not None)
     check("修复：不再误删本地文件",
           "只删「我们下载的临时文件」" in read("video_processor.py"))
     check("修复：本地文件跳过清理", "if not is_local:" in vp_code)
