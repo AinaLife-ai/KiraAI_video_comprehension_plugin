@@ -541,12 +541,13 @@ bot：《原神》4.2 前瞻直播，主要看点：…        ← 完成时（�
 
 ```bash
 cd <插件目录>
-python3 tests/selfcheck.py     # 100 项：静态判据 + 真类行为判据
-python3 tests/smoke_paths.py   # 全参数组合：每条调用路径都不炸
-python3 tests/e2e_flow.py      # 17 项：提交 → 后台 → 通告 全链路
-python3 tests/audit_paths.py   # 失败路径 / 迁移边界 / 配置一致性
-python3 tests/audit_notice.py  # 通告合并、竞态、缓冲滞留
-python3 tests/audit_runtime.py # 并发压力、资源泄漏、terminate
+python3 tests/selfcheck.py      # 100 项：静态判据 + 真类行为判据
+python3 tests/smoke_paths.py    # 全参数组合：每条调用路径都不炸
+python3 tests/e2e_flow.py       # 17 项：提交 → 后台 → 通告 全链路
+python3 tests/audit_paths.py    # 失败路径 / 迁移边界 / 配置一致性
+python3 tests/audit_notice.py   # 通告合并、竞态、缓冲滞留
+python3 tests/audit_runtime.py  # 并发压力、资源泄漏、terminate
+python3 tests/audit_deadcfg.py  # 空配置 / 死代码扫描（防「配置设了没用」）
 ```
 
 不需要 KiraAI 本体与网络（用桩件替换 `core` 包与模型调用）。
@@ -567,7 +568,12 @@ python3 tests/audit_runtime.py # 并发压力、资源泄漏、terminate
     · **`pipeline_hard_timeout_sec` 原先只是「读了个变量」**（空配置）：现已真正实现（到点强制中止并通告失败，且不会跳过通告）；
     · **排队超时被 `cancelled` 覆盖状态**：通告会误报成「任务已取消（插件重载）」；
     · 参数链路加固：`segs/segments` 两种写法都兼容，且已由具名参数承接的键绝不会再随 `**kw` 传下去（否则撞名 `TypeError`，时段分析 100% 失败）。
-  - **测试套件扩充**：`tests/` 现有 6 个套件（`selfcheck` 100 项、`smoke_paths` 全参数组合、`e2e_flow` 17 项、`audit_paths`、`audit_notice`、`audit_runtime`），覆盖参数链路、失败路径、迁移边界、并发压力、通告竞态、资源泄漏。
+  - **测试套件扩充**：`tests/` 现有 7 个套件（`selfcheck` 100 项、`smoke_paths` 全参数组合、`e2e_flow` 17 项、`audit_paths`、`audit_notice`、`audit_runtime`、`audit_deadcfg`），覆盖参数链路、失败路径、迁移边界、并发压力、通告竞态、资源泄漏与空配置扫描。
+  - **清理 3 个空配置 / 死代码**（改造前就存在，本次顺手清掉）：
+    · **`auto_select`「自动选择模型」开关其实完全无效** —— 模型选择只看 `default_model`（`auto` / `1..4`），这个开关设了没有任何作用。已从 schema 移除（**注意：老配置文件里残留的该键会被忽略，不影响加载**）。
+    · **`max_duration_auto`** 此前算出来就没人读 —— 现已**接上**：时长超限时会明确告诉用户「上限是**自动跟随**模型组（附各组数值）」还是「你在安全限制里手填的」，并指出去哪里改（而不是只说一句「时长过长」）。
+    · **`upload_host`（单数）** 是遗留兼容字段：**兼容读取保留**（老配置里可能只有它），但那份赋值给 `self.upload_host` 的死代码已删除。
+    · 另外把 3 处「防御性 `getattr(self, ...)`」统一成正常字段（都已在 `__init__` 定义），避免以后再出现「漏初始化却不报错」的隐形问题。
   - **并行看视频**：每会话 `max_parallel_per_chat`（默认 **3**）+ 全局 `max_parallel_global`（默认 6），超出排队；排队超 `queue_timeout_sec`（默认 600 秒）则明确告知「未执行」，**不会静默丢失**。追问不计入并发上限。多个任务几乎同时完成时按 `notice_coalesce_sec`（默认 2 秒）**合并成一条通知**，避免连开多轮对话。
   - **缓存/转写也纳入闸**：此前收到视频即裸 `create_task` 下载+转写（含 VAD 与多路 ASR 切片），群里连发多个视频会同时开多路重活；现统一走后台闸。
   - **其他修复**：

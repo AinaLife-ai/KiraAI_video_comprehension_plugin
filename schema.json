@@ -15,11 +15,6 @@
         "default": false,
         "hint": "关掉后 analyze_video 工具不可用，send_video / search_bili_video 仍可用"
       },
-      "auto_select": {
-        "type": "switch",
-        "name": "自动选择模型",
-        "default": true
-      },
       "default_model": {
         "type": "string",
         "name": "默认模型组",

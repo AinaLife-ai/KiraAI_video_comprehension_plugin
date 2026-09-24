@@ -328,15 +328,19 @@ def build_plugin(tmpdir, cfg=None):
     })()
     inst = main_mod.VideoComprehensionPlugin.__new__(main_mod.VideoComprehensionPlugin)
     # 手工初始化运行状态（绕过 BasePlugin.__init__ 的抽象基类限制）
+    # ⚠️ 必须与 VideoComprehensionPlugin.__init__ 的字段保持同步
+    #    （清理防御性 getattr 后，少一个字段就会 AttributeError）
     for attr, val in [("_pending", {}), ("_sessions", {}), ("_sid_sessions", {}),
                       ("_locks", {}), ("_cleanup", None), ("_auto_sent", {}),
                       ("_ffmpeg_ok", False), ("_stream_unsupported", False),
                       ("_upload_cache", {}), ("_cached_videos", {}),
                       ("_video_failures", {}), ("_asr_tasks", {}),
                       ("_tasks", {}), ("_task_seq", {}), ("_chat_running", {}),
-                      ("_global_running", 0), ("_chat_sem", {}), ("_global_sem", None),
-                      ("_notice_buffer", {}), ("_notice_tasks", set()),
-                      ("_background_tasks", set()), ("_migrated_keys", set())]:
+                      ("_global_running", 0), ("_slot_events", {}),
+                      ("_notice_buffer", {}), ("_flushing", set()),
+                      ("_notice_tasks", set()),
+                      ("_background_tasks", set()), ("_migrated_keys", set()),
+                      ("_bg_sem", None), ("_bg_sem_limit", 0)]:
         setattr(inst, attr, val)
     inst.ctx = ctx
     inst.plugin_cfg = default_cfg

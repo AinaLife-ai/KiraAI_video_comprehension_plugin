@@ -219,6 +219,8 @@ class VideoComprehensionPlugin(BasePlugin):
         self._notice_tasks: set = set()
         self._background_tasks: set = set()             # 后台任务引用（防被 GC 回收）
         self._migrated_keys: set = set()
+        self._bg_sem: Optional[asyncio.Semaphore] = None   # 缓存/转写用的后台闸
+        self._bg_sem_limit = 0                             # 上面那个闸的上限（配置变了要重建）
         self._load_cfg(cfg)
 
     def _load_cfg(self, cfg: dict):
@@ -231,7 +233,6 @@ class VideoComprehensionPlugin(BasePlugin):
         basic = cfg.get("section_basic", {}) or {}
         self.enabled = basic.get("enabled", True)
         self.video_analysis_enabled = basic.get("video_analysis_enabled", False)
-        self.auto_select = basic.get("auto_select", True)
         self.default_model = str(basic.get("default_model", "auto"))
         self.allowed_adapters = basic.get("allowed_adapters", [])
         self.max_session_per_user = int(basic.get("max_session_per_user", 5))
@@ -300,7 +301,9 @@ class VideoComprehensionPlugin(BasePlugin):
 
         us = cfg.get("section_upload", {}) or {}
         self.upload_enabled = bool(us.get("upload_enabled", True))
-        # 多源：upload_hosts（list）优先；兼容旧的 upload_host（string）
+        # 多源：upload_hosts（list）优先；兼容配置里遗留的 upload_host（string）
+        #   ⚠️ 兼容读取要保留（老用户配置里可能只有 upload_host），
+        #      但不必再存一份 self.upload_host —— 那是改造前的死代码。
         hosts = us.get("upload_hosts")
         if hosts is None:
             old = us.get("upload_host")
@@ -309,7 +312,6 @@ class VideoComprehensionPlugin(BasePlugin):
             hosts = [hosts]
         self.upload_hosts = [str(h).strip() for h in (hosts or []) if str(h).strip()] \
             or list(DEFAULT_UPLOAD_HOSTS)
-        self.upload_host = self.upload_hosts[0]   # 兼容旧引用
 
         # ── 语音转写（给模型补上"声音"信息） ──
         au = cfg.get("section_audio", {}) or {}
@@ -663,7 +665,7 @@ class VideoComprehensionPlugin(BasePlugin):
                 bt.cancel()
         self._background_tasks.clear()
         self._notice_buffer.clear()
-        getattr(self, "_flushing", set()).clear() if hasattr(self, "_flushing") else None
+        self._flushing.clear()
         self._pending.clear(); self._sessions.clear(); self._sid_sessions.clear()
         self._cached_videos.clear()
         self._video_failures.clear()
@@ -926,14 +928,10 @@ class VideoComprehensionPlugin(BasePlugin):
             self._slot_events = {}
 
     def _slot_event(self, sid: str) -> asyncio.Event:
-        ev = getattr(self, "_slot_events", None)
-        if ev is None:
-            ev = {}
-            self._slot_events = ev
-        e = ev.get(sid)
+        e = self._slot_events.get(sid)
         if e is None:
             e = asyncio.Event()
-            ev[sid] = e
+            self._slot_events[sid] = e
         return e
 
     def _try_reserve(self, sid: str) -> bool:
@@ -951,7 +949,7 @@ class VideoComprehensionPlugin(BasePlugin):
             self._chat_running[sid] = self._running_count(sid) - 1
         if self._global_running > 0:
             self._global_running -= 1
-        ev = getattr(self, "_slot_events", {}).get(sid)
+        ev = self._slot_events.get(sid)
         if ev is not None:
             ev.set()
 
@@ -1157,7 +1155,7 @@ class VideoComprehensionPlugin(BasePlugin):
 
     def _ensure_flush_task(self, sid: str):
         # 正在 flush 中：它会循环把新到达的任务一并取走，不必再排一个
-        if sid in getattr(self, "_flushing", set()):
+        if sid in self._flushing:
             return
         name = f"vc_notice_{sid}"
         for t in list(self._notice_tasks):
@@ -1185,13 +1183,9 @@ class VideoComprehensionPlugin(BasePlugin):
         buffer 里，直到下一次有任务完成才被带出去（用户表现为「早完成了却没有
         任何消息」）。现在改成：flush 期间循环取走新到达的，收尾再检查一次残留。
         """
-        flushing = getattr(self, "_flushing", None)
-        if flushing is None:
-            flushing = set()
-            self._flushing = flushing
-        if sid in flushing:
+        if sid in self._flushing:
             return                          # 已有 flush 在处理这个会话
-        flushing.add(sid)
+        self._flushing.add(sid)
         try:
             for _ in range(6):
                 tasks = self._notice_buffer.pop(sid, []) or []
@@ -1208,7 +1202,7 @@ class VideoComprehensionPlugin(BasePlugin):
                     logger.exception("[VC] 回灌分析通告失败")
                     return
         finally:
-            flushing.discard(sid)
+            self._flushing.discard(sid)
         # 极端情况下（持续有新任务）还留了残留 → 再排一次，保证不丢
         if self._notice_buffer.get(sid):
             self._ensure_flush_task(sid)
@@ -1834,12 +1828,10 @@ class VideoComprehensionPlugin(BasePlugin):
         不能让它们把「分析任务的槽」占满，否则用户主动发起的分析会排队。
         上限取 max(2, 每会话并发数)，避免连发视频时同时开太多路。
         """
-        sem = getattr(self, "_bg_sem", None)
-        if sem is None or getattr(self, "_bg_sem_limit", 0) != self._bg_limit():
-            sem = asyncio.Semaphore(self._bg_limit())
-            self._bg_sem = sem
+        if self._bg_sem is None or self._bg_sem_limit != self._bg_limit():
+            self._bg_sem = asyncio.Semaphore(self._bg_limit())
             self._bg_sem_limit = self._bg_limit()
-        return sem
+        return self._bg_sem
 
     def _bg_limit(self) -> int:
         return max(2, min(16, self.max_parallel_per_chat * 2))
@@ -2891,6 +2883,30 @@ class VideoComprehensionPlugin(BasePlugin):
 
     # ── 视觉分析（非B站视频存到 other_cache_dir） ──
 
+    def _reject_hint(self, result: dict) -> str:
+        """把「拒绝处理」翻译成带**可操作建议**的文案。
+
+        ⚠️ 这里用上了 `max_duration_auto`：当上限是「自动跟随模型组」时，
+        用户看到「时长超上限」会不知道去哪调（他可能压根没设过这个值）。
+        明确告诉他「这是自动跟随来的、去哪个模型组调」才有用。
+        """
+        err = str(result.get("error") or "无法处理")
+        hint = ""
+        if "时长" in err:
+            if self.max_duration_auto:
+                tops = sorted({p.max_video_sec for p in self._profiles}, reverse=True)
+                hint = (f"\n💡 当前时长上限 {self.max_duration}s 是**自动跟随**"
+                        f"（取已启用模型组里最大的 max_video_sec：{tops[:3]}）。"
+                        f"想放宽就去「模型组 N → 最大视频时长」调大，"
+                        f"或在「安全限制 → 最大视频时长」手填一个更大的值。")
+            else:
+                hint = (f"\n💡 时长上限 {self.max_duration}s 是你在「安全限制 → "
+                        f"最大视频时长」手填的，改那里即可（填 0 = 自动跟随模型组）。")
+        elif "过大" in err:
+            hint = (f"\n💡 大小上限 {self.max_file_mb}MB 可在"
+                    f"「安全限制 → 最大视频文件大小」调整。")
+        return f"⚠️ {err}{hint}"
+
     async def _vision(self, sess_id, sid, stype, surl, bvid, question,
                       segments=None, model_spec=None):
         if not self._profiles: return "未配置模型"
@@ -2955,7 +2971,8 @@ class VideoComprehensionPlugin(BasePlugin):
             segments=[[s, e] for s, e in segments] if segments else None,
             skip_compress=bool(segments),
             skip_compress_if_under_mb=under_mb)
-        if result["status"] == "rejected": return f"⚠️ {result['error']}"
+        if result["status"] == "rejected":
+            return self._reject_hint(result)
         if result["status"] == "error": return f"⚠️ 处理失败：{result['error']}"
 
         sess = VideoSession(sess_id, sid, stype, surl) if sess_id not in self._sessions else self._sessions[sess_id]
