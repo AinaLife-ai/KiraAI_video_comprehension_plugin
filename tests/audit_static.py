@@ -1,10 +1,11 @@
 """静态全量自查：死代码 / 未定义引用 / 未使用配置 / 矛盾"""
 import ast
 import json
+import os
 import re
 import sys
 
-ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 src = open(f"{ROOT}/main.py", encoding="utf-8").read()
 tree = ast.parse(src)
 
@@ -42,21 +43,33 @@ else:
     print("  ✓ 无")
 
 # 2. self 属性：写了但从未读
+def _self_attr(target):
+    """把赋值目标归一到 self 的属性名。
+
+    ``self.x = v`` / ``self.x[k] = v`` / ``self.x.y = v`` 都应记成 ``x``；
+    旧实现直接 ast.unparse(target)，把 ``self._tasks[key]`` 当成属性名
+    ``_tasks[key]``，导致下标赋值全部误报为「只写不读」。
+    """
+    node = target
+    while isinstance(node, (ast.Subscript, ast.Attribute)):
+        if (isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name) and node.value.id == "self"):
+            return node.attr
+        node = node.value
+    return None
+
+
 assigned = set()
-for n in ast.walk(cls):
-    if isinstance(n, ast.Attribute) and isinstance(n.ctx, ast.Name) and n.ctx.id == "self":
-        if isinstance(n.ctx, ast.Name):
-            pass
 for n in ast.walk(cls):
     if isinstance(n, ast.Assign):
         for t in n.targets:
-            s = ast.unparse(t)
-            if s.startswith("self."):
-                assigned.add(s[5:])
+            a = _self_attr(t)
+            if a:
+                assigned.add(a)
     if isinstance(n, ast.AnnAssign) and n.target:
-        s = ast.unparse(n.target)
-        if s.startswith("self."):
-            assigned.add(s[5:])
+        a = _self_attr(n.target)
+        if a:
+            assigned.add(a)
 unused = []
 for a in sorted(assigned):
     pat = re.compile(rf"self\.{re.escape(a)}\b")
