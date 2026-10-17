@@ -320,10 +320,17 @@ async def download_bili_video(bvid, out_dir, info=None, cookie="",
 
     if has_audio:
         try:
-            r = subprocess.run([
-                "ffmpeg", "-y", "-i", str(vpath), "-i", str(apath),
-                "-c:v", "copy", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(fpath),
-            ], capture_output=True, text=True, timeout=300)
+            # ffmpeg 合并最长 300 秒：必须放线程池，否则整条事件循环被钉住
+            # （消息收发、WS 心跳、其它协程全部停摆）。
+            r = await asyncio.to_thread(
+                subprocess.run,
+                [
+                    "ffmpeg", "-y", "-i", str(vpath), "-i", str(apath),
+                    "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+                    "-movflags", "+faststart", str(fpath),
+                ],
+                capture_output=True, text=True, timeout=300,
+            )
             if r.returncode == 0:
                 try: vpath.unlink()
                 except: pass
