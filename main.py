@@ -52,6 +52,56 @@ from bili_dl import (search_bili, get_bili_info, get_ai_summary, download_bili_v
 BILI_RE = re.compile(r"(BV[0-9A-Za-z]{10}|b23\.tv/[^\s]+|bilibili\.com/(?:video/|BV))", re.I)
 
 
+# ── ffmpeg 静态包解压（同步函数，仅供 asyncio.to_thread 调用） ─────────────
+# 解压 100MB+ 的 zip/tar 是 CPU+磁盘密集操作；放在事件循环里会整段卡住消息收发
+# 与 WS 心跳。抽成同步函数后用 to_thread 执行，行为与原实现逐步一致。
+
+def _extract_static_ffmpeg_windows(blob: bytes, static_dir: str) -> bool:
+    """解压 Windows 静态 ffmpeg zip，返回是否成功（原逻辑逐行保留）。"""
+    import io
+    import zipfile
+
+    with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+        got = False
+        for name in zf.namelist():
+            if name.endswith(("ffmpeg.exe", "ffprobe.exe")):
+                zf.extract(name, static_dir)
+                exe_path = os.path.join(static_dir, name)
+                shutil.move(exe_path, os.path.join(static_dir, os.path.basename(name)))
+                got = True
+    if got:
+        # 清理多余文件
+        for d in os.listdir(static_dir):
+            dp = os.path.join(static_dir, d)
+            if os.path.isdir(dp) and d.startswith("ffmpeg"):
+                shutil.rmtree(dp, ignore_errors=True)
+    return got
+
+
+def _extract_static_ffmpeg_linux(blob: bytes, static_dir: str) -> bool:
+    """解压 Linux 静态 ffmpeg tar.xz，返回是否成功（原逻辑逐行保留）。"""
+    import io
+    import tarfile
+
+    with tarfile.open(fileobj=io.BytesIO(blob)) as tar:
+        got = False
+        for m in tar.getmembers():
+            base = os.path.basename(m.name)
+            if base in ("ffmpeg", "ffprobe"):
+                tar.extract(m, path=static_dir)
+                exe_path = os.path.join(static_dir, m.name)
+                shutil.move(exe_path, os.path.join(static_dir, base))
+                os.chmod(os.path.join(static_dir, base), 0o755)
+                got = True
+    if got:
+        # 清理
+        for d in os.listdir(static_dir):
+            dp = os.path.join(static_dir, d)
+            if os.path.isdir(dp) and d.startswith("ffmpeg"):
+                shutil.rmtree(dp, ignore_errors=True)
+    return got
+
+
 def _collect_chain_text(chain) -> str:
     """收集消息链里所有可能带链接的文本。
 
@@ -566,52 +616,30 @@ class VideoComprehensionPlugin(BasePlugin):
                 async with _hx.AsyncClient(follow_redirects=True, timeout=180) as c:
                     resp = await c.get(dl_url)
                     if resp.status_code == 200:
-                        import zipfile, io
-                        with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
-                            got = False
-                            for name in zf.namelist():
-                                if name.endswith(("ffmpeg.exe", "ffprobe.exe")):
-                                    zf.extract(name, static_dir)
-                                    exe_path = os.path.join(static_dir, name)
-                                    shutil.move(exe_path, os.path.join(static_dir, os.path.basename(name)))
-                                    got = True
-                            if got:
-                                # 清理多余文件
-                                for d in os.listdir(static_dir):
-                                    dp = os.path.join(static_dir, d)
-                                    if os.path.isdir(dp) and d.startswith("ffmpeg"):
-                                        shutil.rmtree(dp, ignore_errors=True)
-                                os.environ["PATH"] = static_dir + os.pathsep + os.environ.get("PATH", "")
-                                self._ffmpeg_ok = True
-                                logger.info("[VC] ✅ Windows 静态 ffmpeg+ffprobe 下载完成")
-                                return True
+                        # 解压移出事件循环（zip 可达 100MB+，同步解压会卡住全局）
+                        got = await asyncio.to_thread(
+                            _extract_static_ffmpeg_windows, resp.content, static_dir
+                        )
+                        if got:
+                            os.environ["PATH"] = static_dir + os.pathsep + os.environ.get("PATH", "")
+                            self._ffmpeg_ok = True
+                            logger.info("[VC] ✅ Windows 静态 ffmpeg+ffprobe 下载完成")
+                            return True
             else:
                 # Linux: johnvansickle 提供的 tar.xz（同时包含 ffmpeg 与 ffprobe）
                 dl_url = "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-arm64-static.tar.xz" if arch in ("aarch64", "arm64") else "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
                 async with _hx.AsyncClient(follow_redirects=True, timeout=180) as c:
                     resp = await c.get(dl_url)
                     if resp.status_code == 200:
-                        import tarfile, io
-                        with tarfile.open(fileobj=io.BytesIO(resp.content)) as tar:
-                            got = False
-                            for m in tar.getmembers():
-                                base = os.path.basename(m.name)
-                                if base in ("ffmpeg", "ffprobe"):
-                                    tar.extract(m, path=static_dir)
-                                    exe_path = os.path.join(static_dir, m.name)
-                                    shutil.move(exe_path, os.path.join(static_dir, base))
-                                    os.chmod(os.path.join(static_dir, base), 0o755)
-                                    got = True
-                            if got:
-                                # 清理
-                                for d in os.listdir(static_dir):
-                                    dp = os.path.join(static_dir, d)
-                                    if os.path.isdir(dp) and d.startswith("ffmpeg"):
-                                        shutil.rmtree(dp, ignore_errors=True)
-                                os.environ["PATH"] = static_dir + os.pathsep + os.environ.get("PATH", "")
-                                self._ffmpeg_ok = True
-                                logger.info("[VC] ✅ Linux 静态 ffmpeg+ffprobe 下载完成")
-                                return True
+                        # 解压移出事件循环（tar.xz 可达 100MB+，同步解压会卡住全局）
+                        got = await asyncio.to_thread(
+                            _extract_static_ffmpeg_linux, resp.content, static_dir
+                        )
+                        if got:
+                            os.environ["PATH"] = static_dir + os.pathsep + os.environ.get("PATH", "")
+                            self._ffmpeg_ok = True
+                            logger.info("[VC] ✅ Linux 静态 ffmpeg+ffprobe 下载完成")
+                            return True
         except Exception as e:
             logger.warning("[VC] 静态 ffmpeg 下载失败: %s", e)
 
