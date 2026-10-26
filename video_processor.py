@@ -486,6 +486,7 @@ async def clip_video(src: str, dst: str, start: float, end: float) -> tuple:
     """
     start = max(0.0, float(start))
     req_dur = max(0.1, float(end) - start)
+    tmp = dst + ".part.mp4"
     cmd = [
         "ffmpeg", "-y",
         "-ss", str(start),
@@ -494,16 +495,24 @@ async def clip_video(src: str, dst: str, start: float, end: float) -> tuple:
         "-c", "copy",
         "-avoid_negative_ts", "make_zero",
         "-movflags", "+faststart",
-        dst,
+        tmp,
     ]
 
-    r = await run_subprocess(cmd, timeout=180)
-    if r.returncode != 0 or not os.path.exists(dst) or os.path.getsize(dst) == 0:
-        raise RuntimeError(f"裁剪失败: {(r.stderr or '')[:300]}")
-    info = await get_video_info_async(dst)
-    real_dur = float(info.get("duration") or req_dur)
-    actual_start = max(0.0, start - max(0.0, real_dur - req_dur))
-    return dst, real_dur, actual_start
+    try:
+        r = await run_subprocess(cmd, timeout=180)
+        if r.returncode != 0 or not os.path.exists(tmp) or os.path.getsize(tmp) == 0:
+            raise RuntimeError(f"裁剪失败: {(r.stderr or '')[:300]}")
+        info = await get_video_info_async(tmp)
+        real_dur = float(info.get("duration") or req_dur)
+        actual_start = max(0.0, start - max(0.0, real_dur - req_dur))
+        await asyncio.to_thread(os.replace, tmp, dst)
+        return dst, real_dur, actual_start
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 # ── 音频处理（语音转写用） ─────────────────────────────────

@@ -558,6 +558,7 @@ python3 tests/audit_runtime.py  # 并发压力、资源泄漏、terminate
 python3 tests/audit_deadcfg.py  # 空配置 / 死代码扫描（防「配置设了没用」）
 python3 tests/audit_static.py   # 死方法 / 悬空引用 / 配置使用扫描
 python3 tests/audit_v1180.py    # 44 项：任务、通知、缓存、Prompt、字幕、并发与清理
+python3 tests/audit_v1180_review.py  # 11 项：第二轮锁/多视频/纳秒缓存键/追问/裁剪/硬超时
 python3 tests/audit_media_v1180.py  # 30 项：真实 ffmpeg、进程 kill、回环 HTTP、B站与客户端
 ```
 
@@ -577,6 +578,7 @@ python3 tests/audit_media_v1180.py  # 30 项：真实 ffmpeg、进程 kill、回
   - **并发与速度**：被动 ASR 闸覆盖完整转写生命周期；释放全局槽位时唤醒所有排队会话，避免已有空位仍白等 0.5 秒；同源同参数压缩结果可复用且同键只转码一次；上传 URL 缓存改为有界 LRU；模型客户端显式关闭。
   - **B 站质量与完整性**：original/medium/low 正确选档；medium/original 不再被 html5 低清替代，且分文件缓存；非空半截文件需通过 ffprobe 校验；发送、自动发送、分析共享同 BV 锁；low 保留 html5 免合并优先。
   - **语义与边界**：多段字幕不再包含段间内容，段内为空不回灌整片；非法 `segments` 明确报错；ffprobe 扫描失败改为真实均匀抽帧，零有效画面不伪造灰色帧分析；ffmpeg 与 ffprobe 必须同时存在才算安装成功。
+  - **第二轮边界复审**：转写/上传缓存键升级为纳秒精度（旧转写缓存自动迁移）；锁表清理保留等待者；`cache_scope=all` 对消息链/raw/get_msg 多视频去重处理；活动追问记录 session_id；裁剪也改为原子输出，取消不覆盖旧文件。
   - **低优先资源治理**：会话历史仅保留最近 40 轮（不改变模型输入）、失败记录/空缓存键/任务序号等定期清理，静态 ffmpeg 包只安全提取两个可执行文件。
   - 新增 `tests/audit_v1180.py` 与 `tests/audit_media_v1180.py`，覆盖任务取消、通知重试、缓存身份、真实 ffmpeg/进程 kill、回环 HTTP、B 站分档和真实媒体输出对照；不改变原有交互、模型模式隔离、字幕优先、模型粘性与软预算设计。
 

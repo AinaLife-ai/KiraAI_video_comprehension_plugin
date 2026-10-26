@@ -1027,7 +1027,8 @@ class VideoComprehensionPlugin(BasePlugin):
         # 顺手清理无人持有的锁，避免长期运行后无限增长
         if len(self._locks) > 512:
             for k in [k for k, v in self._locks.items()
-                      if not v.locked() and k != key][:256]:
+                      if not v.locked() and not getattr(v, "_waiters", None)
+                      and k != key][:256]:
                 self._locks.pop(k, None)
         return lock
 
@@ -1700,9 +1701,11 @@ class VideoComprehensionPlugin(BasePlugin):
             try:
                 for ele in self._iter_videos(getattr(m, "chain", None)):
                     f = str(getattr(ele, "file", "") or "")
+                    nm = str(getattr(ele, "name", "") or "")
                     if f.startswith(("http://", "https://")):
-                        nm = str(getattr(ele, "name", "") or "")
                         self._spawn(self._cache_then_transcribe(sid, f, nm), name="vc_cache")
+                    elif os.path.isfile(f):
+                        self._remember_cached(sid, os.path.basename(f), f, f)
             except Exception:
                 continue
 
@@ -2040,10 +2043,32 @@ class VideoComprehensionPlugin(BasePlugin):
     def _transcript_key(self, video_path: str) -> str:
         try:
             st = os.stat(video_path)
+            raw = f"{os.path.abspath(video_path)}:{st.st_size}:{st.st_mtime_ns}"
+        except Exception:
+            raw = str(video_path)
+        return hashlib.md5(raw.encode()).hexdigest()[:16]
+
+    def _legacy_transcript_key(self, video_path: str) -> str:
+        """1.18.0 初版使用的秒级键，仅用于读取并迁移旧缓存。"""
+        try:
+            st = os.stat(video_path)
             raw = f"{os.path.abspath(video_path)}:{st.st_size}:{int(st.st_mtime)}"
         except Exception:
             raw = str(video_path)
         return hashlib.md5(raw.encode()).hexdigest()[:16]
+
+    def _load_video_transcript(self, video_path: str, key: str):
+        """优先纳秒键；兼容旧秒级缓存，命中后迁移而非重跑 ASR。"""
+        data = self._load_transcript(key)
+        if data:
+            return data
+        legacy = self._legacy_transcript_key(video_path)
+        if legacy == key:
+            return None
+        data = self._load_transcript(legacy)
+        if data:
+            self._save_transcript(key, data)
+        return data
 
     def _transcript_path(self, key: str) -> str:
         d = os.path.join(self.other_cache_dir, ".transcripts")
@@ -2113,7 +2138,7 @@ class VideoComprehensionPlugin(BasePlugin):
         if not self.audio_enabled or (not want_sub and not self._asr_ready()):
             return {}
         key = self._transcript_key(video_path)
-        cached = self._load_transcript(key)
+        cached = self._load_video_transcript(video_path, key)
         if cached:
             return cached
         t0 = time.time()
@@ -2208,7 +2233,7 @@ class VideoComprehensionPlugin(BasePlugin):
         key = self._transcript_key(video_path)
         if key in self._asr_tasks and not self._asr_tasks[key].done():
             return self._asr_tasks[key]
-        if self._load_transcript(key):
+        if self._load_video_transcript(video_path, key):
             return None
         task = asyncio.create_task(self._build_transcript(video_path, bvid=bvid, cid=cid,
                                                           skip_asr=skip_asr))
@@ -2230,7 +2255,7 @@ class VideoComprehensionPlugin(BasePlugin):
         if not video_path or not os.path.isfile(video_path):
             return {}
         key = self._transcript_key(video_path)
-        cached = self._load_transcript(key)
+        cached = self._load_video_transcript(video_path, key)
         if cached:
             return cached
         task = self._asr_tasks.get(key)
@@ -2262,6 +2287,7 @@ class VideoComprehensionPlugin(BasePlugin):
         chain_top = getattr(event.message, "chain", None)
         saw_video_ele = False      # 链里出现过 Video（即便 file 为空）
         has_video_seg = False      # raw_message 里有 video 段
+        raw_videos = []            # raw/get_msg 里的全部视频 (url, name)
 
         # 1) 消息链里的 Video 元素（含引用 chain / 合并转发 chains）
         try:
@@ -2295,8 +2321,13 @@ class VideoComprehensionPlugin(BasePlugin):
                 for s in segs:
                     if isinstance(s, dict) and s.get("type") == "video":
                         has_video_seg = True
-                        url = (s.get("data") or {}).get("url") or ""
-                        break
+                        data = s.get("data") or {}
+                        u = data.get("url") or ""
+                        if u:
+                            raw_videos.append((str(u), str(data.get("name") or "")))
+                        if not url:
+                            url = u
+                            vname = str(data.get("name") or "")
 
         # 3) 兜底：主动调 OneBot 接口拉（当前消息 → 引用消息）
         #    只在「确实有视频迹象」时才调，避免每条纯文字消息都白跑一次 API
@@ -2307,30 +2338,40 @@ class VideoComprehensionPlugin(BasePlugin):
                 ad = self.ctx.adapter_mgr.get_adapter(event.adapter.name)
                 cl = ad.get_client()
 
-                async def _scan_get_msg(mid) -> str:
-                    """取一条消息，返回其中的视频 URL"""
+                async def _scan_get_msg(mid) -> list:
+                    """取一条消息里的全部视频 (url, name)。"""
                     if not mid:
-                        return ""
+                        return []
                     rm = await cl.send_action("get_msg", {"id": mid}, timeout=15)
+                    found = []
                     if isinstance(rm, dict):
                         for s in (rm.get("message") or []):
                             if isinstance(s, dict) and s.get("type") == "video":
-                                return (s.get("data") or {}).get("url", "") or ""
-                    return ""
+                                data = s.get("data") or {}
+                                u = data.get("url") or ""
+                                if u:
+                                    found.append((str(u), str(data.get("name") or "")))
+                    return found
 
                 # 3a) 当前消息
                 mid = getattr(event.message, "message_id", None) or getattr(event, "message_id", None)
                 try:
-                    url = await _scan_get_msg(mid)
+                    found = await _scan_get_msg(mid)
+                    raw_videos.extend(found)
+                    if found:
+                        url, vname = found[0]
                 except Exception:
-                    url = ""
+                    pass
                 # 3b) 引用消息（适配器若没解析出内层链，这里按被引用消息 ID 主动拉）
                 if not url:
                     for rid in reply_ids:
                         try:
-                            url = await _scan_get_msg(rid)
+                            found = await _scan_get_msg(rid)
+                            raw_videos.extend(found)
+                            if found:
+                                url, vname = found[0]
                         except Exception:
-                            url = ""
+                            pass
                         if url:
                             logger.info("[VC] 通过引用消息 ID 主动拉到视频: %s", rid)
                             break
@@ -2344,9 +2385,26 @@ class VideoComprehensionPlugin(BasePlugin):
             #   mentioned → 只在被 @ / 引用 / 唤醒时才缓存（默认，最省）
             # 注意：URL 始终记录在 _pending，所以 bot 主动调工具时永远有源可用。
             if self.auto_cache_video:
-                if str(url).startswith(("http://", "https://")):
-                    if self.cache_scope == "all":
-                        self._spawn(self._cache_then_transcribe(sid, url, vname), name="vc_cache")
+                if self.cache_scope == "all":
+                    candidates = []
+                    try:
+                        for ele in self._iter_videos(chain_top):
+                            f = str(getattr(ele, "file", "") or "")
+                            if f:
+                                candidates.append((f, str(getattr(ele, "name", "") or "")))
+                    except Exception:
+                        pass
+                    candidates.extend(raw_videos)
+                    candidates.append((str(url), vname))
+                    seen = set()
+                    for u, n in candidates:
+                        if not u or u in seen:
+                            continue
+                        seen.add(u)
+                        if u.startswith(("http://", "https://")):
+                            self._spawn(self._cache_then_transcribe(sid, u, n), name="vc_cache")
+                        elif os.path.isfile(u):
+                            self._remember_cached(sid, os.path.basename(u), u, u)
                 elif os.path.isfile(url):
                     self._remember_cached(sid, os.path.basename(url), url, url)
 
@@ -2903,6 +2961,7 @@ class VideoComprehensionPlugin(BasePlugin):
         task.progress = "正在解析视频来源"
         if kind == "followup":
             task.progress = "正在回答追问"
+            task.session_id = sess.session_id if sess else ""
             return await self._followup(sess, question, model_spec)
         if kind == "segment":
             task.progress = "正在按时间段抽帧分析"
@@ -3383,7 +3442,8 @@ class VideoComprehensionPlugin(BasePlugin):
                     logger.info("[VC] 文件 %.1fMB 超过上传上限 %dMB，改用 base64",
                                 size_mb, self.upload_max_mb)
                     return None
-                key = f"{path}:{os.path.getmtime(path):.0f}"
+                st = os.stat(path)
+                key = f"{path}:{st.st_size}:{st.st_mtime_ns}"
                 if key in self._upload_cache:
                     url = self._upload_cache.pop(key)
                     self._upload_cache[key] = url  # LRU：命中后移到最新位置
